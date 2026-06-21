@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
-import platform
 import time
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
@@ -13,7 +11,6 @@ import pkce
 from music_assistant_models.errors import LoginFailed
 
 from music_assistant.helpers.auth import AuthenticationHelper
-from music_assistant.helpers.process import check_output
 
 from .constants import CALLBACK_REDIRECT_URL, SCOPE
 
@@ -21,31 +18,6 @@ if TYPE_CHECKING:
     import aiohttp
 
     from music_assistant import MusicAssistant
-
-
-async def get_librespot_binary() -> str:
-    """Find the correct librespot binary belonging to the platform."""
-
-    async def check_librespot(librespot_path: str) -> str | None:
-        try:
-            returncode, output = await check_output(librespot_path, "--version")
-            if returncode == 0 and b"librespot" in output:
-                return librespot_path
-            return None
-        except OSError:
-            return None
-
-    base_path = os.path.join(os.path.dirname(__file__), "bin")
-    system = platform.system().lower().replace("darwin", "macos")
-    architecture = platform.machine().lower()
-
-    if librespot_binary := await check_librespot(
-        os.path.join(base_path, f"librespot-{system}-{architecture}")
-    ):
-        return librespot_binary
-
-    msg = f"Unable to locate Librespot for {system}/{architecture}"
-    raise RuntimeError(msg)
 
 
 async def get_spotify_token(

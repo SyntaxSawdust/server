@@ -47,7 +47,6 @@ from orjson import JSONDecodeError
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.app_vars import app_var  # type: ignore[attr-defined]
 from music_assistant.helpers.json import json_loads
-from music_assistant.helpers.process import check_output
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
 from music_assistant.helpers.util import lock
 from music_assistant.models.music_provider import MusicProvider
@@ -60,7 +59,7 @@ from .constants import (
     CONF_SYNC_PODCAST_PROGRESS,
     LIKED_SONGS_FAKE_PLAYLIST_ID_PREFIX,
 )
-from .helpers import get_librespot_binary, get_spotify_token
+from .helpers import get_spotify_token
 from .parsers import (
     parse_album,
     parse_artist,
@@ -70,7 +69,7 @@ from .parsers import (
     parse_podcast_episode,
     parse_track,
 )
-from .streaming import LibrespotStreamer
+from .streaming import GoLibrespotStreamer
 
 
 class NotModifiedError(Exception):
@@ -85,7 +84,6 @@ class SpotifyProvider(MusicProvider):
     # Developer session (user's custom client ID) - optional
     _auth_info_dev: dict[str, Any] | None = None
     _sp_user: dict[str, Any] | None = None
-    _librespot_bin: str | None = None
     _audiobooks_supported = False
     # True if user has configured a custom client ID with valid authentication
     dev_session_active: bool = False
@@ -96,10 +94,8 @@ class SpotifyProvider(MusicProvider):
         self.cache_dir = os.path.join(self.mass.cache_path, self.instance_id)
         # Default throttler for global session (heavy rate limited)
         self.throttler = ThrottlerManager(rate_limit=1, period=2)
-        self.streamer = LibrespotStreamer(self)
+        self.streamer = GoLibrespotStreamer(self)
 
-        # check if we have a librespot binary for this arch
-        self._librespot_bin = await get_librespot_binary()
         # try login which will raise if it fails (logs in global session)
         await self.login()
 
@@ -127,6 +123,15 @@ class SpotifyProvider(MusicProvider):
                 "See https://support.spotify.com/us/authors/article/audiobooks-availability/ "
                 "for supported countries."
             )
+
+        # launch the go-librespot streaming daemon (it authenticates with the
+        # Spotify session token written into its config)
+        await self.streamer.start()
+
+    async def unload(self, is_removed: bool = False) -> None:
+        """Stop the go-librespot streaming daemon."""
+        if streamer := getattr(self, "streamer", None):
+            await streamer.stop()
 
     @property
     def audiobooks_supported(self) -> bool:
@@ -678,7 +683,7 @@ class SpotifyProvider(MusicProvider):
             chapter_uris = []
             for chapter in chapters_data:
                 chapter_id = chapter["id"]
-                chapter_uri = f"spotify://episode:{chapter_id}"
+                chapter_uri = f"spotify:episode:{chapter_id}"
                 chapter_uris.append(chapter_uri)
 
             return StreamDetails(
@@ -686,6 +691,12 @@ class SpotifyProvider(MusicProvider):
                 provider=self.instance_id,
                 media_type=MediaType.AUDIOBOOK,
                 audio_format=AudioFormat(content_type=ContentType.OGG, bit_rate=320),
+                decoded_audio_format=AudioFormat(
+                    content_type=ContentType.PCM_S16LE,
+                    sample_rate=44100,
+                    bit_depth=16,
+                    channels=2,
+                ),
                 stream_type=StreamType.CUSTOM,
                 allow_seek=True,
                 can_seek=True,
@@ -699,6 +710,12 @@ class SpotifyProvider(MusicProvider):
             provider=self.instance_id,
             media_type=media_type,
             audio_format=AudioFormat(content_type=ContentType.OGG, bit_rate=320),
+            decoded_audio_format=AudioFormat(
+                content_type=ContentType.PCM_S16LE,
+                sample_rate=44100,
+                bit_depth=16,
+                channels=2,
+            ),
             stream_type=StreamType.CUSTOM,
             allow_seek=True,
             can_seek=True,
@@ -803,11 +820,6 @@ class SpotifyProvider(MusicProvider):
             CONF_REFRESH_TOKEN_GLOBAL, auth_info["refresh_token"], encrypted=True
         )
 
-        # Setup librespot with global token only if dev token is not configured
-        # (if dev token exists, librespot will be set up in login_dev instead)
-        if not self.config.get_value(CONF_REFRESH_TOKEN_DEV):
-            await self._setup_librespot_auth(auth_info["access_token"])
-
         # get logged-in user info
         if not self._sp_user:
             self._sp_user = userinfo = await self._get_data(
@@ -861,9 +873,6 @@ class SpotifyProvider(MusicProvider):
         self._update_config_value(
             CONF_REFRESH_TOKEN_DEV, auth_info["refresh_token"], encrypted=True
         )
-
-        # Setup librespot with dev token (preferred over global token)
-        await self._setup_librespot_auth(auth_info["access_token"])
 
         self.logger.info("Successfully logged in to Spotify developer session")
         return auth_info
@@ -954,36 +963,6 @@ class SpotifyProvider(MusicProvider):
             items_received += len(api_result["audiobooks"]["items"])
 
         return items_received
-
-    async def _setup_librespot_auth(self, access_token: str) -> None:
-        """
-        Set up librespot authentication with the given access token.
-
-        :param access_token: Spotify access token to use for librespot authentication.
-        """
-        if self._librespot_bin is None:
-            raise LoginFailed("Librespot binary not available")
-
-        args = [
-            self._librespot_bin,
-            "--cache",
-            self.cache_dir,
-            "--check-auth",
-        ]
-        ret_code, stdout = await check_output(*args)
-        if ret_code != 0:
-            # cached librespot creds are invalid, re-authenticate
-            # we can use the check-token option to send a new token to librespot
-            # librespot will then get its own token from spotify (somehow) and cache that.
-            args += [
-                "--access-token",
-                access_token,
-            ]
-            ret_code, stdout = await check_output(*args)
-            if ret_code != 0:
-                # this should not happen, but guard it just in case
-                err_str = stdout.decode("utf-8").strip()
-                raise LoginFailed(f"Failed to verify credentials on Librespot: {err_str}")
 
     async def _get_auth_info(self, use_global_session: bool = False) -> dict[str, Any]:
         """
