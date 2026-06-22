@@ -9,6 +9,7 @@ import os
 import pathlib
 import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self, TypeGuard, TypeVar, cast, overload
 from uuid import uuid4
 
@@ -87,7 +88,7 @@ EventSubscriptionType = tuple[
 
 LOGGER = logging.getLogger(MASS_LOGGER_NAME)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = str(Path(__file__).resolve().parent)
 PROVIDERS_PATH = os.path.join(BASE_DIR, "providers")
 
 _R = TypeVar("_R")

@@ -19,6 +19,7 @@ import os
 import time
 from collections.abc import AsyncGenerator
 from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
@@ -650,7 +651,7 @@ class SpotifyConnectProvider(PluginProvider):
         name is user-provided). The config dir doubles as the credential/device
         cache so the Spotify Connect device stays paired across restarts.
         """
-        os.makedirs(self.cache_dir, exist_ok=True)
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
         connect_name = cast("str", self.config.get_value(CONF_PUBLISH_NAME)) or self.name
         initial_volume = 50
         if self._default_player_id != PLAYER_ID_AUTO:

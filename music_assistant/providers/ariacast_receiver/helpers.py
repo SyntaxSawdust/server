@@ -24,7 +24,7 @@ def _get_binary_path() -> str:
     binary_name = f"ariacast_{system}_{arch}"
     binary_path = os.path.join(base_dir, binary_name)
 
-    if not os.path.exists(binary_path):
+    if not Path(binary_path).exists():
         raise FileNotFoundError(f"Binary not found at {binary_path}")
 
     Path(binary_path).chmod(Path(binary_path).stat().st_mode | stat.S_IEXEC)

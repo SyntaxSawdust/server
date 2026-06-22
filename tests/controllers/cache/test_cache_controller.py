@@ -3,6 +3,7 @@
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -307,7 +308,7 @@ async def test_cache_warns_when_exceeding_limit(
 
     assert "exceeds recommended maximum" in caplog.text
     for path in db_files:
-        assert os.path.exists(path)
+        assert Path(path).exists()
 
 
 async def test_cache_does_not_warn_when_under_limit(
@@ -330,7 +331,7 @@ async def test_cache_does_not_warn_when_under_limit(
 
     assert "exceeds recommended maximum" not in caplog.text
     for path in db_files:
-        assert os.path.exists(path)
+        assert Path(path).exists()
 
 
 async def test_all_three_db_files_included_in_size(
@@ -353,7 +354,7 @@ async def test_all_three_db_files_included_in_size(
 
     assert "exceeds recommended maximum" in caplog.text
     for suffix in ("", "-wal", "-shm"):
-        assert os.path.exists(db_path + suffix)
+        assert Path(db_path + suffix).exists()
 
 
 # --- allow_expired_cache flag ---
