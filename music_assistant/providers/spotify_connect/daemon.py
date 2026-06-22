@@ -16,12 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
 
 from music_assistant.helpers.process import AsyncProcess
-from music_assistant.helpers.util import select_free_port
 
 from .client import EventCallback, GoLibrespotClient
 from .helpers import get_go_librespot_binary
@@ -38,6 +38,26 @@ MAX_RESTARTS = 5
 # Called with the daemon's API port; returns the config.yml contents. Awaited on
 # every (re)start so callers can refresh short-lived values such as access tokens.
 ConfigBuilder = Callable[[int], Awaitable[dict[str, Any]]]
+
+
+def _find_free_loopback_port(range_start: int, range_end: int) -> int:
+    """
+    Return the first port in the range free to bind on 127.0.0.1.
+
+    The daemon's API server binds 127.0.0.1, so we probe that exact address. The
+    shared ``is_port_in_use`` probes the 0.0.0.0 wildcard with ``SO_REUSEADDR``,
+    which on macOS/BSD does not detect another process's loopback-specific bind —
+    it would hand out a port already taken by another go-librespot daemon.
+    """
+    for port in range(range_start, range_end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+                return port
+            except OSError:
+                continue
+    msg = f"No free loopback port available in range {range_start}-{range_end}"
+    raise OSError(msg)
 
 
 class GoLibrespotDaemon:
@@ -87,7 +107,9 @@ class GoLibrespotDaemon:
     async def start(self) -> None:
         """Resolve the binary, pick a port and launch the supervised daemon + events tasks."""
         self._binary = get_go_librespot_binary()
-        self.api_port = await select_free_port(API_PORT_RANGE_START, API_PORT_RANGE_END)
+        self.api_port = await asyncio.to_thread(
+            _find_free_loopback_port, API_PORT_RANGE_START, API_PORT_RANGE_END
+        )
         self.client = GoLibrespotClient(self.mass, f"http://127.0.0.1:{self.api_port}", self.logger)
         # Two self-healing supervisors: one keeps the daemon process alive, the
         # other keeps the events websocket connected (reconnecting across daemon
