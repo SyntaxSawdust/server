@@ -1,0 +1,12 @@
+{
+  "type": "music",
+  "domain": "anghami",
+  "stage": "beta",
+  "name": "Anghami",
+  "description": "Stream music, playlists and charts from Anghami.",
+  "codeowners": ["@OzGav"],
+  "requirements": [],
+  "documentation": "https://music-assistant.io/music-providers/anghami/",
+  "multi_instance": true,
+  "icon": "music-circle"
+}

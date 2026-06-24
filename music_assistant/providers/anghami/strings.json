@@ -1,0 +1,60 @@
+{
+  "config_entries": {
+    "client_id": {
+      "label": "Client ID",
+      "description": "The Client ID of your Anghami Developer Portal application."
+    },
+    "redirect_uri": {
+      "label": "Redirect URI",
+      "description": "A Redirect URI registered for your Anghami application. After login you will be redirected here; copy that URL back into Music Assistant."
+    },
+    "start_login_label": {
+      "label": "The button below will redirect you to Anghami to authenticate. After authenticating you will be redirected to your Redirect URI; copy the full URL from the address bar and return here."
+    },
+    "start_login": {
+      "label": "Authenticate with Anghami",
+      "description": "Opens the Anghami login page to start the authentication.",
+      "action_label": "Authenticate with Anghami"
+    },
+    "redirected_url_label": {
+      "label": "Paste the full URL you were redirected to (it contains the authorization code) into the field below."
+    },
+    "redirected_url": {
+      "label": "Redirected URL",
+      "description": "The full URL from the address bar after authenticating on Anghami."
+    },
+    "complete_login_label": {
+      "label": "After pasting the URL above, click the button below to complete the login."
+    },
+    "complete_login": {
+      "label": "Complete authentication",
+      "description": "Exchanges the authorization code for an access token.",
+      "action_label": "Complete authentication"
+    },
+    "code_verifier": {
+      "label": "PKCE code verifier"
+    },
+    "state": {
+      "label": "OAuth state"
+    },
+    "label_ok": {
+      "label": "You are authenticated with Anghami"
+    },
+    "clear_auth": {
+      "label": "[%key:common::config_entries::clear_auth::label%]",
+      "description": "Reset the authentication for Anghami"
+    },
+    "access_token": {
+      "label": "Access token for Anghami"
+    },
+    "refresh_token": {
+      "label": "Refresh token for Anghami"
+    },
+    "expiry_time": {
+      "label": "Expiry time of the Anghami access token"
+    }
+  },
+  "manifest": {
+    "description": "Stream music, playlists and charts from Anghami."
+  }
+}
