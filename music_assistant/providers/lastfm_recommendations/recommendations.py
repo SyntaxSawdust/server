@@ -5,20 +5,23 @@ from __future__ import annotations
 import asyncio
 import random
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any, TypeVar
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from music_assistant_models.enums import ExternalID, MediaType
+from music_assistant_models.errors import MediaNotFoundError, ProviderUnavailableError
 from music_assistant_models.media_items import (
     Album,
     Artist,
+    ItemMapping,
     RecommendationFolder,
     Track,
     UniqueList,
 )
 
-from music_assistant.constants import CONF_USERNAME
+from music_assistant.constants import CONF_USERNAME, VARIOUS_ARTISTS_NAME
 from music_assistant.helpers.compare import compare_strings
-from music_assistant.helpers.datetime import utc
+from music_assistant.helpers.datetime import utc, utc_timestamp
 from music_assistant.helpers.util import parse_title_and_version
 from music_assistant.providers.lastfm_recommendations.constants import (
     CACHE_CATEGORY_RESOLVED_ITEMS,
@@ -32,7 +35,8 @@ from music_assistant.providers.lastfm_recommendations.constants import (
     GENRE_ARTISTS_LIMIT,
     GENRE_ARTISTS_PERIOD,
     LIBRARY_MATCH_SCAN_LIMIT,
-    RECENT_TRACKS_SCAN_LIMIT,
+    RECENT_PLAYS_SCAN_LIMIT,
+    RECENT_PLAYS_WINDOW_DAYS,
     RESOLUTION_BUFFER_LARGE,
     RESOLUTION_BUFFER_SMALL,
     SIMILAR_ITEMS_BUFFER,
@@ -58,6 +62,13 @@ if TYPE_CHECKING:
     from music_assistant.providers.lastfm_recommendations import LastFMRecommendationsProvider
 
 _MediaItemT = TypeVar("_MediaItemT", Artist, Album, Track)
+
+
+class _SeedTrack(NamedTuple):
+    """A recently played track used to seed similar-artist/track lookups."""
+
+    artist: str
+    name: str
 
 
 class LastFMRecommendationManager:
@@ -405,7 +416,10 @@ class LastFMRecommendationManager:
         if not self.provider.config.get_value(CONF_ENABLE_PERSONALIZED):
             return
 
-        top_artists = await self._get_top_artists_by_track_plays()
+        # Both seed rows derive from the same recent play events, so scan the playlog once.
+        recent_plays = await self._get_recent_play_seeds()
+
+        top_artists = self._rank_seed_artists(recent_plays)
 
         if top_artists:
             similar_artists = await self._get_similar_artists_from_seeds(top_artists)
@@ -422,12 +436,7 @@ class LastFMRecommendationManager:
                     icon="mdi-account-music-outline",
                 )
 
-        top_tracks = await self.mass.music.tracks.library_items(
-            limit=TOP_TRACKS_LIMIT, order_by="play_count_desc"
-        )
-        # only seed from tracks actually played, so a new library of unplayed tracks
-        # doesn't produce a row from arbitrary zero-play seeds
-        top_tracks = [track for track in top_tracks if track.last_played]
+        top_tracks = self._rank_seed_tracks(recent_plays)[:TOP_TRACKS_LIMIT]
 
         if top_tracks:
             similar_tracks = await self._get_similar_tracks_from_seeds(top_tracks)
@@ -730,58 +739,96 @@ class LastFMRecommendationManager:
                     icon="mdi-earth",
                 )
 
-    async def _get_top_artists_by_track_plays(self) -> list[Artist]:
+    async def _get_recent_play_seeds(self) -> list[_SeedTrack]:
         """
-        Return the user's most listened library artists to seed recommendations.
+        Return artist/track pairs for recently played tracks, most recent first.
 
-        :return: Up to TOP_ARTISTS_LIMIT artists, most listened first.
+        Plays whose track or artist cannot be resolved are omitted.
         """
-        # Artist play_count only increments when an artist is played as a unit, so rank by
-        # appearances across the user's most recently played tracks instead. Ordering happens
-        # in the DB; ties fall to the more recently played artist via insertion order.
-        recent_tracks = await self.mass.music.tracks.library_items(
-            limit=RECENT_TRACKS_SCAN_LIMIT, order_by="last_played_desc"
+        # Seed from the recent-play log rather than lifetime play_count, so stale favourites and
+        # old one-off album playthroughs drop out once they age past the window.
+        cutoff = int(utc_timestamp()) - RECENT_PLAYS_WINDOW_DAYS * 24 * 60 * 60
+        plays = await self.mass.music.recently_played(
+            limit=RECENT_PLAYS_SCAN_LIMIT,
+            media_types=[MediaType.TRACK],
+            played_after_timestamp=cutoff,
         )
-        counts: dict[str | int, int] = {}
-        for track in recent_tracks:
-            if not track.last_played:
-                continue
-            for artist in track.artists:
-                counts[artist.item_id] = counts.get(artist.item_id, 0) + 1
+        # The playlog stores no artist, so resolve each play back to its track to recover it.
+        # get_provider_item prefers cache over an API call and library plays resolve from the
+        # database. The recent-play window matches the get_track cache TTL (both 30 days) and each
+        # build re-warms it, so seeds stay cache-resident however often recommendations refresh.
+        resolved = await asyncio.gather(*[self._resolve_seed_track(play) for play in plays])
+        return [seed for seed in resolved if seed is not None]
 
-        top_artist_ids = sorted(counts, key=lambda item_id: counts[item_id], reverse=True)[
-            :TOP_ARTISTS_LIMIT
-        ]
-        resolved = await asyncio.gather(
-            *[self.mass.music.artists.get_library_item(item_id) for item_id in top_artist_ids],
-            return_exceptions=True,
-        )
-        return [artist for artist in resolved if isinstance(artist, Artist)]
+    async def _resolve_seed_track(self, play: ItemMapping) -> _SeedTrack | None:
+        """
+        Resolve a recently played track to an artist/track seed, or None if unavailable.
 
-    async def _get_similar_artists_from_seeds(self, seed_artists: list[Artist]) -> list[Artist]:
+        :param play: A recent play entry from the playlog.
+        """
+        # A removed provider or a dropped streaming id leaves the play unresolvable; skip it.
+        with suppress(MediaNotFoundError, ProviderUnavailableError):
+            track = await self.mass.music.tracks.get_provider_item(play.item_id, play.provider)
+            # Various Artists is a compilation placeholder, not a usable similar-lookup seed.
+            if track.artists and track.artists[0].name != VARIOUS_ARTISTS_NAME:
+                return _SeedTrack(artist=track.artists[0].name, name=track.name)
+        return None
+
+    def _rank_seed_tracks(self, recent_plays: list[_SeedTrack]) -> list[_SeedTrack]:
+        """
+        Return distinct recently played tracks, most recent first.
+
+        :param recent_plays: Recently played artist/track pairs, most recent first.
+        """
+        seen: set[tuple[str, str]] = set()
+        unique: list[_SeedTrack] = []
+        for seed in recent_plays:
+            key = (seed.artist.lower(), seed.name.lower())
+            if key not in seen:
+                seen.add(key)
+                unique.append(seed)
+        return unique
+
+    def _rank_seed_artists(self, recent_plays: list[_SeedTrack]) -> list[str]:
+        """
+        Rank artists by how many of their tracks were recently played, most first.
+
+        :param recent_plays: Recently played artist/track pairs, most recent first.
+        """
+        # The playlog has no per-play counts, so rank by distinct recently played tracks per
+        # artist; ties fall to the more recently played artist via the most-recent-first order.
+        counts: dict[str, int] = {}
+        names_by_key: dict[str, str] = {}
+        order: list[str] = []
+        for seed in self._rank_seed_tracks(recent_plays):
+            key = seed.artist.lower()
+            if key not in counts:
+                order.append(key)
+                names_by_key[key] = seed.artist
+            counts[key] = counts[key] + 1 if key in counts else 1
+
+        order.sort(key=lambda key: counts[key], reverse=True)
+        return [names_by_key[key] for key in order[:TOP_ARTISTS_LIMIT]]
+
+    async def _get_similar_artists_from_seeds(self, seed_artists: list[str]) -> list[Artist]:
         """
         Return resolved artists similar to the given seed artists.
 
-        :param seed_artists: Seed artists from the user's library.
+        :param seed_artists: Names of the user's recently played artists.
         """
         all_similar: list[dict[str, Any]] = []
 
-        # Seed identifiers are tracked so seeds don't appear in their own recommendations.
-        seed_mbids = {
-            seed_artist.get_external_id(ExternalID.MB_ARTIST)
-            for seed_artist in seed_artists
-            if seed_artist.get_external_id(ExternalID.MB_ARTIST)
-        }
-        seed_names = {seed_artist.name.lower() for seed_artist in seed_artists}
+        # Seed names are tracked so seeds don't appear in their own recommendations.
+        seed_names = {name.lower() for name in seed_artists}
 
         similar_lists = await asyncio.gather(
             *[
                 self.api.get_similar_artists(
-                    artist_name=seed.name,
-                    artist_mbid=seed.get_external_id(ExternalID.MB_ARTIST),
+                    artist_name=name,
+                    artist_mbid=None,
                     limit=SIMILAR_ITEMS_PER_SEED,
                 )
-                for seed in seed_artists
+                for name in seed_artists
             ]
         )
         for similar in similar_lists:
@@ -796,8 +843,6 @@ class LastFMRecommendationManager:
             mbid = artist_data.get("mbid")
             name = artist_data.get("name", "").lower()
 
-            if mbid and mbid in seed_mbids:
-                continue
             if name and name in seed_names:
                 continue
 
@@ -822,31 +867,23 @@ class LastFMRecommendationManager:
         )
         return self._exclude_owned([artist for artist in resolved_artists if artist is not None])
 
-    async def _get_similar_tracks_from_seeds(self, seed_tracks: list[Track]) -> list[Track]:
+    async def _get_similar_tracks_from_seeds(self, seed_tracks: list[_SeedTrack]) -> list[Track]:
         """
         Return resolved tracks similar to the given seed tracks.
 
-        :param seed_tracks: Seed tracks from the user's library.
+        :param seed_tracks: The user's recently played artist/track pairs.
         """
         all_similar: list[dict[str, Any]] = []
 
-        # Seed identifiers are tracked so seeds don't appear in their own recommendations.
-        seed_mbids = {
-            seed_track.get_external_id(ExternalID.MB_RECORDING)
-            for seed_track in seed_tracks
-            if seed_track.get_external_id(ExternalID.MB_RECORDING)
-        }
-        seed_name_keys = {
-            f"{seed_track.artists[0].name if seed_track.artists else ''}_{seed_track.name}".lower()
-            for seed_track in seed_tracks
-        }
+        # Seed names are tracked so seeds don't appear in their own recommendations.
+        seed_name_keys = {f"{seed.artist}_{seed.name}".lower() for seed in seed_tracks}
 
         similar_lists = await asyncio.gather(
             *[
                 self.api.get_similar_tracks(
-                    artist_name=seed.artists[0].name if seed.artists else "Unknown Artist",
+                    artist_name=seed.artist,
                     track_name=seed.name,
-                    track_mbid=seed.get_external_id(ExternalID.MB_RECORDING),
+                    track_mbid=None,
                     limit=SIMILAR_ITEMS_PER_SEED,
                 )
                 for seed in seed_tracks
@@ -871,8 +908,6 @@ class LastFMRecommendationManager:
             track_name = track_data.get("name", "")
             name_key = f"{artist_name}_{track_name}".lower() if artist_name and track_name else ""
 
-            if mbid and mbid in seed_mbids:
-                continue
             if name_key and name_key in seed_name_keys:
                 continue
 
