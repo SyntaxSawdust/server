@@ -1187,11 +1187,24 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             # one-off items like TTS or some sound effect etc.
             return
 
+        # store artists/album so streaming plays not in the library remain seedable; keep them as
+        # ItemMapping json so co-artists and the album survive and stay resolvable later
+        item_artists = getattr(media_item, "artists", None)
+        item_album = getattr(media_item, "album", None)
+
         params = {
             "item_id": media_item.item_id,
             "provider": media_item.provider,
             "media_type": media_item.media_type.value,
             "name": media_item.name,
+            "artists": serialize_to_json(
+                [ItemMapping.from_item(artist).to_dict() for artist in item_artists]
+            )
+            if item_artists
+            else None,
+            "album": serialize_to_json(ItemMapping.from_item(item_album).to_dict())
+            if item_album
+            else None,
             "image": serialize_to_json(media_item.image.to_dict()) if media_item.image else None,
             "fully_played": fully_played,
             "seconds_played": seconds_played,

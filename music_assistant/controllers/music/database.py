@@ -241,6 +241,8 @@ class MusicDatabaseSetupMixin:
                 [provider] TEXT NOT NULL,
                 [media_type] TEXT NOT NULL,
                 [name] TEXT NOT NULL,
+                [artists] json,
+                [album] json,
                 [image] json,
                 [timestamp] INTEGER DEFAULT 0,
                 [fully_played] BOOLEAN,

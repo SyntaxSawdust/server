@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from datetime import datetime
+from sqlite3 import OperationalError
 from typing import TYPE_CHECKING, cast
 
 from music_assistant_models.enums import MediaType
@@ -704,6 +705,17 @@ async def migrate_database(  # noqa: PLR0915
             await mass.music.genres.restore_default_genres(full_restore=False)
         except Exception as err:
             logger.warning("Could not seed default podcast/audiobook genres: %s", err)
+
+    if prev_version <= 46:
+        # add artists/album columns to playlog so recommendation seeds remain available for
+        # streaming plays that were never added to the library; stored as ItemMapping json so
+        # co-artists and the album survive and stay resolvable. Existing rows backfill on next play.
+        for column in ("[artists] json", "[album] json"):
+            try:
+                await database.execute(f"ALTER TABLE {DB_TABLE_PLAYLOG} ADD COLUMN {column}")
+            except OperationalError as err:
+                if "duplicate column" not in str(err):
+                    raise
 
     # save changes
     await database.commit()
