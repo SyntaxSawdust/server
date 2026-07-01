@@ -1447,6 +1447,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 media.image_url = self.mass.metadata.get_image_url(
                     queue_item.image, size=512, image_format="jpeg", prefer_stream_server=True
                 )
+        if queue_item.queue_id.startswith("blind_test_"):
+            media.title = "Blind Test"
+            media.artist = "Music Assistant"
+            media.album = ""
+            media.image_url = MASS_LOGO_ONLINE
         return media
 
     def get_next_item(self, queue_id: str, cur_index: int | str) -> QueueItem | None:

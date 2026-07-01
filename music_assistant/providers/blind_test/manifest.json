@@ -1,0 +1,13 @@
+{
+  "type": "plugin",
+  "stage": "experimental",
+  "domain": "blind_test",
+  "name": "Blind Test",
+  "description": "Host a multiplayer blind test game where guests join with a QR code and guess the currently playing track.",
+  "codeowners": ["@music-assistant"],
+  "requirements": [],
+  "documentation": "https://music-assistant.io/plugins/blind-test",
+  "multi_instance": false,
+  "builtin": false,
+  "icon": "music-note-question"
+}
