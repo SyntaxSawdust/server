@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import MediaType
+from music_assistant_models.enums import EventType, MediaType
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Playlist, Track
 
@@ -23,6 +23,7 @@ from music_assistant.providers.blind_test.models import (
     BlindTestPlayer,
     BlindTestRound,
     BlindTestSession,
+    BlindTestSource,
     BlindTestSuggestion,
 )
 from music_assistant.providers.blind_test.session import (
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
 
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
+EVENT_SESSION_REMOVED = "blind_test_session_removed"
 
 
 async def setup(
@@ -106,6 +108,27 @@ class BlindTestPlugin(PluginProvider):
                 "blind_test/session",
                 self.get_session,
                 required_role="user",
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "blind_test/sessions",
+                self.list_sessions,
+                required_role="user",
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "blind_test/rename",
+                self.rename_session,
+                required_role="user",
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "blind_test/info",
+                self.get_session_info,
+                authenticated=False,
             )
         )
         self._unregister_handles.append(
@@ -171,6 +194,13 @@ class BlindTestPlugin(PluginProvider):
                 required_role="user",
             )
         )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "blind_test/delete",
+                self.delete_session,
+                required_role="user",
+            )
+        )
 
     async def create_session(
         self,
@@ -201,7 +231,7 @@ class BlindTestPlugin(PluginProvider):
             suggestion_count=suggestion_count,
             answer_duration=answer_duration,
             source_uris=source_uris or [],
-            name=name,
+            name=_clean_session_name(name),
             play_on_player=play_on_player,
             play_on_joined_players=play_on_joined_players,
         )
@@ -210,9 +240,24 @@ class BlindTestPlugin(PluginProvider):
             session_id=secrets.token_urlsafe(12),
             join_code=secrets.token_urlsafe(8),
             config=config,
+            sources=await self._resolve_session_sources(config.source_uris),
+            created_at=time.time(),
+            updated_at=time.time(),
         )
         self._sessions[session.session_id] = session
         return _host_state(session)
+
+    async def list_sessions(self) -> list[dict[str, Any]]:
+        """Return live Blind Test session summaries."""
+        summaries: list[dict[str, Any]] = []
+        for session in self._sessions.values():
+            self._sync_answering_phase(session)
+            summaries.append(_session_summary(session))
+        return sorted(
+            summaries,
+            key=lambda item: float(item["updated_at"]),
+            reverse=True,
+        )
 
     async def get_session(self, session_id: str) -> dict[str, Any]:
         """
@@ -223,6 +268,28 @@ class BlindTestPlugin(PluginProvider):
         session = self._get_session(session_id)
         self._sync_answering_phase(session)
         return _host_state(session)
+
+    async def rename_session(self, session_id: str, name: str | None = None) -> dict[str, Any]:
+        """
+        Rename a Blind Test session.
+
+        :param session_id: Session ID to rename.
+        :param name: New display name.
+        """
+        session = self._get_session(session_id)
+        session.config.name = _clean_session_name(name)
+        _touch_session(session)
+        return _host_state(session)
+
+    async def get_session_info(self, session_id: str) -> dict[str, Any]:
+        """
+        Return public metadata for a Blind Test session.
+
+        :param session_id: Session ID to fetch.
+        """
+        session = self._get_session(session_id)
+        self._sync_answering_phase(session)
+        return _session_info(session)
 
     async def join_session(
         self,
@@ -252,6 +319,7 @@ class BlindTestPlugin(PluginProvider):
             sendspin_player_id=_clean_sendspin_player_id(sendspin_player_id),
         )
         add_player(session, player)
+        _touch_session(session)
         await self._attach_player_to_current_playback(session, player)
         return {
             "player_id": player.player_id,
@@ -277,9 +345,12 @@ class BlindTestPlugin(PluginProvider):
         player = _get_player_by_token(session, player_token)
         player.last_seen = time.time()
         player.connected = True
+        _touch_session(session)
         if sendspin_player_id:
-            player.sendspin_player_id = _clean_sendspin_player_id(sendspin_player_id)
-            await self._attach_player_to_current_playback(session, player)
+            cleaned_sendspin_player_id = _clean_sendspin_player_id(sendspin_player_id)
+            if cleaned_sendspin_player_id != player.sendspin_player_id:
+                player.sendspin_player_id = cleaned_sendspin_player_id
+                await self._attach_player_to_current_playback(session, player)
         return _player_state(session, player)
 
     async def start_session(
@@ -299,6 +370,7 @@ class BlindTestPlugin(PluginProvider):
             round_payload or await self.prepare_round(session_id),
         )
         start_round(session, blind_test_round, time.time())
+        _touch_session(session)
         await self._play_round(session)
         return _host_state(session)
 
@@ -314,7 +386,7 @@ class BlindTestPlugin(PluginProvider):
         search_results = await self.mass.music.search(
             search_query=correct.label,
             media_types=[MediaType.TRACK],
-            limit=max(session.config.suggestion_count * 3, 12),
+            limit=max(session.config.suggestion_count * 8, 24),
             library_only=False,
         )
         distractors = [
@@ -355,6 +427,7 @@ class BlindTestPlugin(PluginProvider):
         player = _get_player_by_token(session, player_token)
         submit_answer(session, player.player_id, suggestion_id, time.time())
         player.last_seen = time.time()
+        _touch_session(session)
         self._sync_answering_phase(session)
         return _player_state(session, player)
 
@@ -366,6 +439,7 @@ class BlindTestPlugin(PluginProvider):
         """
         session = self._get_session(session_id)
         reveal_round(session)
+        _touch_session(session)
         return _host_state(session)
 
     async def ready(self, session_id: str, player_token: str) -> dict[str, Any]:
@@ -379,6 +453,7 @@ class BlindTestPlugin(PluginProvider):
         player = _get_player_by_token(session, player_token)
         mark_player_ready(session, player.player_id)
         player.last_seen = time.time()
+        _touch_session(session)
         if are_active_players_ready(session):
             await self._advance_from_reveal(session)
         return _player_state(session, player)
@@ -409,7 +484,24 @@ class BlindTestPlugin(PluginProvider):
         session = self._get_session(session_id)
         await self._stop_playback(session)
         reset_session(session)
+        _touch_session(session)
         return _host_state(session)
+
+    async def delete_session(self, session_id: str) -> dict[str, str]:
+        """
+        Delete a Blind Test session and stop its playback targets.
+
+        :param session_id: Session ID.
+        """
+        session = self._get_session(session_id)
+        await self._stop_playback(session)
+        self._sessions.pop(session_id, None)
+        self.mass.signal_event(
+            EventType.UNKNOWN,
+            object_id=session_id,
+            data={"type": EVENT_SESSION_REMOVED, "session_id": session_id},
+        )
+        return {"session_id": session_id}
 
     async def _advance_from_reveal(
         self,
@@ -420,11 +512,13 @@ class BlindTestPlugin(PluginProvider):
         if len(session.rounds) >= session.config.round_count:
             await self._stop_playback(session)
             finish_session(session)
+            _touch_session(session)
             return
         if round_payload is None:
             round_payload = await self.prepare_round(session.session_id)
         blind_test_round = _round_from_payload(session, round_payload)
         start_round(session, blind_test_round, time.time())
+        _touch_session(session)
         await self._play_round(session)
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -445,6 +539,29 @@ class BlindTestPlugin(PluginProvider):
             return self._sessions[session_id]
         except KeyError as err:
             raise InvalidDataError("Unknown Blind Test session") from err
+
+    async def _resolve_session_sources(self, source_uris: list[str]) -> list[BlindTestSource]:
+        """Resolve configured source URIs into host-visible source metadata."""
+        sources: list[BlindTestSource] = []
+        for source_uri in source_uris:
+            try:
+                media_item = await self.mass.music.get_item_by_uri(source_uri)
+            except Exception as err:
+                self.logger.debug("Could not resolve Blind Test source %s: %s", source_uri, err)
+                sources.append(BlindTestSource(uri=source_uri, name=source_uri))
+                continue
+
+            media_type = getattr(media_item, "media_type", None)
+            sources.append(
+                BlindTestSource(
+                    uri=source_uri,
+                    name=getattr(media_item, "name", source_uri) or source_uri,
+                    media_type=media_type.value
+                    if isinstance(media_type, MediaType)
+                    else media_type,
+                )
+            )
+        return sources
 
     def _sync_answering_phase(self, session: BlindTestSession) -> None:
         """Reveal an answering round when answers are complete or time is up."""
@@ -468,6 +585,7 @@ class BlindTestPlugin(PluginProvider):
         answer_deadline_reached = now >= current_round.started_at + round_duration
         if all_active_players_answered or answer_deadline_reached:
             reveal_round(session)
+            _touch_session(session)
 
     async def _play_round(self, session: BlindTestSession) -> None:
         """Start playback for the current round."""
@@ -696,6 +814,13 @@ def _is_blind_test_sendspin_player_id(player_id: str) -> bool:
     return player_id.startswith("blind_test_")
 
 
+def _clean_session_name(name: str | None) -> str | None:
+    """Return a normalized optional session name."""
+    if not name:
+        return None
+    return name.strip() or None
+
+
 def _round_from_payload(
     session: BlindTestSession,
     payload: dict[str, Any],
@@ -720,6 +845,40 @@ def _round_from_payload(
         duration=payload.get("duration"),
         suggestions=suggestions,
     )
+
+
+def _touch_session(session: BlindTestSession) -> None:
+    """Mark a session as updated."""
+    session.updated_at = time.time()
+
+
+def _session_summary(session: BlindTestSession) -> dict[str, Any]:
+    """Return a compact host-visible live session summary."""
+    current_round = (
+        session.current_round_index + 1 if session.current_round_index is not None else 0
+    )
+    return {
+        "session_id": session.session_id,
+        "name": session.config.name or "Blind Test",
+        "phase": session.phase,
+        "player_count": len(session.players),
+        "connected_player_count": sum(1 for player in session.players.values() if player.connected),
+        "current_round": current_round,
+        "round_count": session.config.round_count,
+        "created_at": session.created_at,
+        "updated_at": session.updated_at,
+    }
+
+
+def _session_info(session: BlindTestSession) -> dict[str, Any]:
+    """Return public metadata for a joinable session."""
+    return {
+        "session_id": session.session_id,
+        "name": session.config.name or "Blind Test",
+        "phase": session.phase,
+        "player_count": len(session.players),
+        "round_count": session.config.round_count,
+    }
 
 
 def _host_state(session: BlindTestSession) -> dict[str, Any]:
@@ -769,4 +928,5 @@ def _track_to_candidate(track: Track) -> SuggestionCandidate:
     return SuggestionCandidate(
         label=build_answer_label(track.artist_str or None, track.name),
         uri=track.uri,
+        title=track.name,
     )

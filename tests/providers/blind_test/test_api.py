@@ -8,7 +8,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import MediaType
+from music_assistant_models.enums import EventType, MediaType
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import (
     ItemMapping,
@@ -37,6 +37,7 @@ def _create_plugin() -> BlindTestPlugin:
     plugin.mass.player_queues.stop = AsyncMock()
     plugin.mass.players.play_media = AsyncMock()
     plugin.mass.players.cmd_set_members = AsyncMock()
+    plugin.mass.music.get_item_by_uri = AsyncMock(side_effect=_get_source_item_by_uri)
     plugin.mass.metadata.get_image_url_for_item = AsyncMock(return_value=None)
     plugin.logger = MagicMock()
     plugin._sessions = {}
@@ -95,6 +96,14 @@ def _playlist(item_id: str = "playlist") -> Playlist:
             )
         },
     )
+
+
+async def _get_source_item_by_uri(uri: str) -> Track | Playlist:
+    """Return a source item for a test URI."""
+    item_id = uri.rsplit("/", 1)[-1]
+    if "/playlist/" in uri:
+        return _playlist(item_id)
+    return _track(item_id, f"Track {item_id}", "Artist")
 
 
 def _session_with_round(phase: BlindTestPhase) -> BlindTestSession:
@@ -166,10 +175,13 @@ async def test_loaded_in_mass_registers_api_commands() -> None:
 
     await plugin.loaded_in_mass()
 
-    assert mass.register_api_command.call_count == 11
+    assert mass.register_api_command.call_count == 15
     assert [call.args[0] for call in mass.register_api_command.call_args_list] == [
         "blind_test/create",
         "blind_test/session",
+        "blind_test/sessions",
+        "blind_test/rename",
+        "blind_test/info",
         "blind_test/join",
         "blind_test/state",
         "blind_test/start",
@@ -179,6 +191,7 @@ async def test_loaded_in_mass_registers_api_commands() -> None:
         "blind_test/ready",
         "blind_test/next",
         "blind_test/reset",
+        "blind_test/delete",
     ]
 
 
@@ -223,6 +236,108 @@ async def test_create_session_returns_host_state() -> None:
     assert state["config"]["round_count"] == 3
     assert state["config"]["name"] == "Friday quiz"
     assert state["config"]["play_on_joined_players"] is True
+    assert state["sources"] == [
+        {
+            "uri": "library://track/1",
+            "name": "Track 1",
+            "media_type": "track",
+        }
+    ]
+    assert state["created_at"] > 0
+    assert state["updated_at"] > 0
+
+
+@pytest.mark.asyncio
+async def test_create_session_trims_optional_name() -> None:
+    """Session names are trimmed and may be omitted."""
+    plugin = _create_plugin()
+
+    named = await plugin.create_session(
+        player_id="queue_1",
+        source_uris=["library://track/1"],
+        name="  Friday quiz  ",
+    )
+    unnamed = await plugin.create_session(
+        player_id="queue_1",
+        source_uris=["library://track/1"],
+        name="   ",
+    )
+
+    assert named["config"]["name"] == "Friday quiz"
+    assert unnamed["config"]["name"] is None
+
+
+@pytest.mark.asyncio
+async def test_rename_session_updates_name_and_summary() -> None:
+    """Rename an existing session and expose it in host summaries."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+
+    renamed = await plugin.rename_session("session", "  Saturday quiz  ")
+
+    assert renamed["config"]["name"] == "Saturday quiz"
+    assert plugin._sessions["session"].updated_at > 0
+    assert (await plugin.list_sessions())[0]["name"] == "Saturday quiz"
+
+    unnamed = await plugin.rename_session("session", "   ")
+
+    assert unnamed["config"]["name"] is None
+    assert (await plugin.list_sessions())[0]["name"] == "Blind Test"
+
+
+@pytest.mark.asyncio
+async def test_get_session_info_returns_public_join_metadata() -> None:
+    """Expose minimal session metadata to unauthenticated join pages."""
+    plugin = _create_plugin()
+    session = _session()
+    session.config.name = "Saturday quiz"
+    plugin._sessions["session"] = session
+    await plugin.join_session("session", "Alice")
+
+    info = await plugin.get_session_info("session")
+
+    assert info == {
+        "session_id": "session",
+        "name": "Saturday quiz",
+        "phase": BlindTestPhase.LOBBY,
+        "player_count": 1,
+        "round_count": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_returns_live_session_summaries() -> None:
+    """Return compact host summaries for the active Blind Test rooms."""
+    plugin = _create_plugin()
+    first = await plugin.create_session(
+        player_id="queue_1",
+        source_uris=["library://track/1"],
+        name="First room",
+    )
+    second = await plugin.create_session(
+        player_id="queue_1",
+        source_uris=["library://track/2"],
+        name="Second room",
+    )
+    await plugin.join_session(first["session_id"], "Alice")
+
+    summaries = await plugin.list_sessions()
+
+    assert [summary["session_id"] for summary in summaries] == [
+        first["session_id"],
+        second["session_id"],
+    ]
+    assert summaries[0] == {
+        "session_id": first["session_id"],
+        "name": "First room",
+        "phase": BlindTestPhase.LOBBY,
+        "player_count": 1,
+        "connected_player_count": 1,
+        "current_round": 0,
+        "round_count": 2,
+        "created_at": first["created_at"],
+        "updated_at": plugin._sessions[first["session_id"]].updated_at,
+    }
 
 
 @pytest.mark.asyncio
@@ -301,6 +416,36 @@ async def test_late_reconnect_with_sendspin_id_is_grouped() -> None:
     )
 
     mass.players.cmd_set_members.assert_awaited_with(
+        target_player="queue_1",
+        player_ids_to_add=["blind_test_session_bob"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeated_state_poll_does_not_regroup_same_sendspin_id() -> None:
+    """Polling state with the same Sendspin ID should not restart grouped playback."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    await plugin.join_session("session", "Alice", "blind_test_session_alice")
+    await plugin.start_session("session", _round_payload())
+    joined = await plugin.join_session("session", "Bob")
+    mass = cast("MagicMock", plugin.mass)
+    mass.players.get_player.return_value = SimpleNamespace(
+        can_group_with=["blind_test_session_bob"]
+    )
+
+    await plugin.get_player_state(
+        "session",
+        joined["player_token"],
+        "blind_test_session_bob",
+    )
+    await plugin.get_player_state(
+        "session",
+        joined["player_token"],
+        "blind_test_session_bob",
+    )
+
+    mass.players.cmd_set_members.assert_awaited_once_with(
         target_player="queue_1",
         player_ids_to_add=["blind_test_session_bob"],
     )
@@ -824,3 +969,27 @@ async def test_reset_session_keeps_room_and_clears_game_state() -> None:
         "blind_test_session_alice",
         "queue_1",
     ]
+
+
+@pytest.mark.asyncio
+async def test_delete_session_stops_playback_and_removes_room() -> None:
+    """Host can close a Blind Test room from the live sessions list."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    await plugin.join_session("session", "Alice", "blind_test_session_alice")
+    await plugin.start_session("session", _round_payload(1))
+
+    result = await plugin.delete_session("session")
+
+    assert result == {"session_id": "session"}
+    assert "session" not in plugin._sessions
+    mass = cast("MagicMock", plugin.mass)
+    assert [call.args[0] for call in mass.player_queues.stop.await_args_list] == [
+        "blind_test_session_alice",
+        "queue_1",
+    ]
+    mass.signal_event.assert_called_once_with(
+        EventType.UNKNOWN,
+        object_id="session",
+        data={"type": "blind_test_session_removed", "session_id": "session"},
+    )

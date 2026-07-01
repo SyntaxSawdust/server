@@ -32,6 +32,15 @@ class BlindTestConfig(DataClassDictMixin):
 
 
 @dataclass
+class BlindTestSource(DataClassDictMixin):
+    """A music source selected for a Blind Test session."""
+
+    uri: str
+    name: str
+    media_type: str | None = None
+
+
+@dataclass
 class BlindTestPlayer(DataClassDictMixin):
     """A player participating in a Blind Test session."""
 
@@ -91,6 +100,9 @@ class BlindTestSession(DataClassDictMixin):
     join_code: str
     config: BlindTestConfig
     phase: BlindTestPhase = BlindTestPhase.LOBBY
+    created_at: float = 0
+    updated_at: float = 0
     players: dict[str, BlindTestPlayer] = field(default_factory=dict)
     rounds: list[BlindTestRound] = field(default_factory=list)
+    sources: list[BlindTestSource] = field(default_factory=list)
     current_round_index: int | None = None

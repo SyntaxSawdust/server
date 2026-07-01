@@ -6,10 +6,13 @@ import random
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 
 from music_assistant.providers.blind_test.models import BlindTestSuggestion
 
 NORMALIZE_PATTERN = re.compile(r"[^a-z0-9]+")
+MAX_LABEL_SIMILARITY = 0.78
+MAX_TOKEN_CONTAINMENT = 0.85
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,7 @@ class SuggestionCandidate:
 
     label: str
     uri: str | None = None
+    title: str | None = None
 
 
 def normalize_answer_label(label: str) -> str:
@@ -27,6 +31,46 @@ def normalize_answer_label(label: str) -> str:
     :param label: Answer label to normalize.
     """
     return NORMALIZE_PATTERN.sub(" ", label.casefold()).strip()
+
+
+def answer_labels_are_too_close(first_label: str, second_label: str) -> bool:
+    """
+    Return if two answer labels are too similar to use together.
+
+    :param first_label: First answer label to compare.
+    :param second_label: Second answer label to compare.
+    """
+    first = normalize_answer_label(first_label)
+    second = normalize_answer_label(second_label)
+    if not first or not second:
+        return False
+    if first == second:
+        return True
+
+    similarity = SequenceMatcher(None, first, second).ratio()
+    if similarity >= MAX_LABEL_SIMILARITY:
+        return True
+
+    first_tokens = set(first.split())
+    second_tokens = set(second.split())
+    shared_tokens = first_tokens & second_tokens
+    token_containment = len(shared_tokens) / min(len(first_tokens), len(second_tokens))
+    return token_containment >= MAX_TOKEN_CONTAINMENT
+
+
+def suggestion_candidates_are_too_close(
+    first: SuggestionCandidate,
+    second: SuggestionCandidate,
+) -> bool:
+    """
+    Return if two candidates are too similar to use together.
+
+    Prefer comparing raw track titles when available so artists with similar
+    names do not dominate the distance check.
+    """
+    if first.title and second.title:
+        return answer_labels_are_too_close(first.title, second.title)
+    return answer_labels_are_too_close(first.label, second.label)
 
 
 def build_answer_label(artist: str | None, title: str) -> str:
@@ -94,6 +138,11 @@ def _select_distractors(
     for candidate in distractors:
         candidate_label = normalize_answer_label(candidate.label)
         if not candidate_label or candidate_label in seen_labels:
+            continue
+        if any(
+            suggestion_candidates_are_too_close(candidate, selected_candidate)
+            for selected_candidate in (correct, *selected)
+        ):
             continue
         if candidate.uri and candidate.uri in seen_uris:
             continue
