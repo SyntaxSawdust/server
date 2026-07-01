@@ -87,6 +87,9 @@ class BlindTestRound(DataClassDictMixin):
     suggestions: list[BlindTestSuggestion]
     image_url: str | None = None
     duration: float | None = None
+    lyrics: str | None = None
+    lrc_lyrics: str | None = None
+    lyrics_loaded: bool = False
     started_at: float | None = None
     ended_at: float | None = None
     answers: dict[str, BlindTestAnswer] = field(default_factory=dict)

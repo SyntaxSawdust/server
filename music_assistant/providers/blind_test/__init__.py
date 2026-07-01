@@ -92,6 +92,7 @@ class BlindTestPlugin(PluginProvider):
         """Initialize the Blind Test plugin."""
         super().__init__(mass, manifest, config, supported_features)
         self._sessions: dict[str, BlindTestSession] = {}
+        self._lyrics_tasks: set[tuple[str, int, str]] = set()
         self._unregister_handles: list[Callable[[], None]] = []
 
     async def loaded_in_mass(self) -> None:
@@ -266,7 +267,7 @@ class BlindTestPlugin(PluginProvider):
         :param session_id: Session ID to fetch.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase(session)
+        self._sync_answering_phase_and_schedule_lyrics(session)
         return _host_state(session)
 
     async def rename_session(self, session_id: str, name: str | None = None) -> dict[str, Any]:
@@ -288,7 +289,7 @@ class BlindTestPlugin(PluginProvider):
         :param session_id: Session ID to fetch.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase(session)
+        self._sync_answering_phase_and_schedule_lyrics(session)
         return _session_info(session)
 
     async def join_session(
@@ -321,6 +322,7 @@ class BlindTestPlugin(PluginProvider):
         add_player(session, player)
         _touch_session(session)
         await self._attach_player_to_current_playback(session, player)
+        self._schedule_current_round_lyrics_hydration(session)
         return {
             "player_id": player.player_id,
             "player_token": player_token,
@@ -341,7 +343,7 @@ class BlindTestPlugin(PluginProvider):
         :param sendspin_player_id: Temporary Sendspin player ID for this phone.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase(session)
+        self._sync_answering_phase_and_schedule_lyrics(session)
         player = _get_player_by_token(session, player_token)
         player.last_seen = time.time()
         player.connected = True
@@ -351,6 +353,7 @@ class BlindTestPlugin(PluginProvider):
             if cleaned_sendspin_player_id != player.sendspin_player_id:
                 player.sendspin_player_id = cleaned_sendspin_player_id
                 await self._attach_player_to_current_playback(session, player)
+        self._schedule_current_round_lyrics_hydration(session)
         return _player_state(session, player)
 
     async def start_session(
@@ -423,12 +426,12 @@ class BlindTestPlugin(PluginProvider):
         :param suggestion_id: Selected suggestion ID.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase(session)
+        self._sync_answering_phase_and_schedule_lyrics(session)
         player = _get_player_by_token(session, player_token)
         submit_answer(session, player.player_id, suggestion_id, time.time())
         player.last_seen = time.time()
         _touch_session(session)
-        self._sync_answering_phase(session)
+        self._sync_answering_phase_and_schedule_lyrics(session)
         return _player_state(session, player)
 
     async def reveal(self, session_id: str) -> dict[str, Any]:
@@ -439,6 +442,7 @@ class BlindTestPlugin(PluginProvider):
         """
         session = self._get_session(session_id)
         reveal_round(session)
+        self._schedule_current_round_lyrics_hydration(session)
         _touch_session(session)
         return _host_state(session)
 
@@ -456,6 +460,7 @@ class BlindTestPlugin(PluginProvider):
         _touch_session(session)
         if are_active_players_ready(session):
             await self._advance_from_reveal(session)
+        self._schedule_current_round_lyrics_hydration(session)
         return _player_state(session, player)
 
     async def next_round(
@@ -530,6 +535,7 @@ class BlindTestPlugin(PluginProvider):
         for unregister in self._unregister_handles:
             unregister()
         self._unregister_handles.clear()
+        self._lyrics_tasks.clear()
         self._sessions.clear()
         await super().unload(is_removed)
 
@@ -586,6 +592,85 @@ class BlindTestPlugin(PluginProvider):
         if all_active_players_answered or answer_deadline_reached:
             reveal_round(session)
             _touch_session(session)
+
+    def _sync_answering_phase_and_schedule_lyrics(self, session: BlindTestSession) -> None:
+        """Sync automatic reveal state and schedule reveal-only lyrics."""
+        self._sync_answering_phase(session)
+        self._schedule_current_round_lyrics_hydration(session)
+
+    def _schedule_current_round_lyrics_hydration(self, session: BlindTestSession) -> None:
+        """Fetch current reveal lyrics in the background without blocking players."""
+        if session.phase != BlindTestPhase.REVEAL or session.current_round_index is None:
+            return
+        current_round = get_current_round(session)
+        if current_round.lyrics_loaded:
+            return
+        task_key = (session.session_id, current_round.round_index, current_round.track_uri)
+        if task_key in self._lyrics_tasks:
+            return
+        self._lyrics_tasks.add(task_key)
+        track_hash = hashlib.sha1(current_round.track_uri.encode()).hexdigest()[:10]
+        try:
+            self.mass.create_task(
+                self._hydrate_current_round_lyrics,
+                session.session_id,
+                current_round.round_index,
+                current_round.track_uri,
+                task_id=f"blind_test_lyrics_{session.session_id}_{current_round.round_index}_{track_hash}",
+            )
+        except Exception:
+            self._lyrics_tasks.discard(task_key)
+            raise
+
+    async def _hydrate_current_round_lyrics(
+        self,
+        session_id: str,
+        round_index: int,
+        track_uri: str,
+    ) -> None:
+        """Fetch lyrics for a revealed round once."""
+        task_key = (session_id, round_index, track_uri)
+        try:
+            session = self._sessions.get(session_id)
+            if (
+                session is None
+                or session.phase != BlindTestPhase.REVEAL
+                or session.current_round_index != round_index
+            ):
+                return
+            current_round = get_current_round(session)
+            if current_round.track_uri != track_uri or current_round.lyrics_loaded:
+                return
+            try:
+                media_item = await self.mass.music.get_item_by_uri(track_uri)
+                lyrics, lrc_lyrics = (
+                    await self.mass.metadata.get_track_lyrics(media_item)
+                    if isinstance(media_item, Track)
+                    else (None, None)
+                )
+            except Exception as err:
+                self.logger.debug(
+                    "Could not fetch Blind Test lyrics for %s: %s",
+                    track_uri,
+                    err,
+                )
+                lyrics, lrc_lyrics = None, None
+            session = self._sessions.get(session_id)
+            if (
+                session is None
+                or session.phase != BlindTestPhase.REVEAL
+                or session.current_round_index != round_index
+            ):
+                return
+            current_round = get_current_round(session)
+            if current_round.track_uri != track_uri:
+                return
+            current_round.lyrics = lyrics
+            current_round.lrc_lyrics = lrc_lyrics
+            current_round.lyrics_loaded = True
+            _touch_session(session)
+        finally:
+            self._lyrics_tasks.discard(task_key)
 
     async def _play_round(self, session: BlindTestSession) -> None:
         """Start playback for the current round."""
@@ -904,6 +989,9 @@ def _player_state(session: BlindTestSession, player: BlindTestPlayer) -> dict[st
     state["current_player_id"] = player.player_id
     if session.phase == BlindTestPhase.ANSWERING:
         for round_state in state["rounds"]:
+            round_state.pop("lyrics_loaded", None)
+            round_state.pop("lyrics", None)
+            round_state.pop("lrc_lyrics", None)
             for suggestion in round_state["suggestions"]:
                 suggestion.pop("is_correct", None)
     return state

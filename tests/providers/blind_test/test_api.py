@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -33,14 +34,36 @@ def _create_plugin() -> BlindTestPlugin:
     """Create a minimally configured Blind Test plugin for unit tests."""
     plugin = BlindTestPlugin.__new__(BlindTestPlugin)
     plugin.mass = MagicMock()
+
+    def _schedule_task(
+        target: Callable[..., Awaitable[Any]] | Awaitable[Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> asyncio.Task[Any]:
+        kwargs.pop("task_id", None)
+        kwargs.pop("abort_existing", None)
+        eager_start = kwargs.pop("eager_start", True)
+        coro = cast(
+            "Coroutine[Any, Any, Any]",
+            target(*args, **kwargs) if callable(target) else target,
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            return asyncio.Task(coro, loop=loop, eager_start=eager_start)
+        except TypeError:
+            return loop.create_task(coro)  # pragma: no cover - Python < 3.12 fallback
+
+    plugin.mass.create_task = MagicMock(side_effect=_schedule_task)
     plugin.mass.player_queues.play_media = AsyncMock()
     plugin.mass.player_queues.stop = AsyncMock()
     plugin.mass.players.play_media = AsyncMock()
     plugin.mass.players.cmd_set_members = AsyncMock()
     plugin.mass.music.get_item_by_uri = AsyncMock(side_effect=_get_source_item_by_uri)
     plugin.mass.metadata.get_image_url_for_item = AsyncMock(return_value=None)
+    plugin.mass.metadata.get_track_lyrics = AsyncMock(return_value=(None, None))
     plugin.logger = MagicMock()
     plugin._sessions = {}
+    plugin._lyrics_tasks = set()
     plugin._unregister_handles = []
     return plugin
 
@@ -488,6 +511,24 @@ async def test_get_player_state_hides_correct_answer_while_answering() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_player_state_hides_lyrics_while_answering() -> None:
+    """Do not leak reveal lyrics during the answering phase."""
+    plugin = _create_plugin()
+    session = _session_with_round(BlindTestPhase.ANSWERING)
+    session.rounds[0].lyrics = "plain lyrics"
+    session.rounds[0].lrc_lyrics = "[00:01.00]synced lyrics"
+    session.rounds[0].lyrics_loaded = True
+    plugin._sessions["session"] = session
+    joined = await plugin.join_session("session", "Alice")
+
+    state = await plugin.get_player_state("session", joined["player_token"])
+
+    assert "lyrics" not in state["rounds"][0]
+    assert "lrc_lyrics" not in state["rounds"][0]
+    assert "lyrics_loaded" not in state["rounds"][0]
+
+
+@pytest.mark.asyncio
 async def test_get_player_state_reveals_correct_answer_during_reveal() -> None:
     """Expose the correct answer once the session is in reveal."""
     plugin = _create_plugin()
@@ -498,6 +539,74 @@ async def test_get_player_state_reveals_correct_answer_during_reveal() -> None:
 
     assert state["rounds"][0]["suggestions"][0]["is_correct"] is True
     assert state["rounds"][0]["suggestions"][1]["is_correct"] is False
+
+
+@pytest.mark.asyncio
+async def test_join_session_includes_reveal_lyrics() -> None:
+    """Late joiners during reveal receive lyrics once the background task completes."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session_with_round(BlindTestPhase.REVEAL)
+    mass = cast("MagicMock", plugin.mass)
+    lyrics_requested = asyncio.Event()
+    release_lyrics = asyncio.Event()
+
+    async def delayed_lyrics(_track: Track) -> tuple[str, str]:
+        lyrics_requested.set()
+        await release_lyrics.wait()
+        return ("plain lyrics", "[00:01.00]synced lyrics")
+
+    mass.metadata.get_track_lyrics = AsyncMock(side_effect=delayed_lyrics)
+
+    joined = await plugin.join_session("session", "Alice")
+
+    assert joined["state"]["rounds"][0].get("lyrics") is None
+    assert joined["state"]["rounds"][0]["lyrics_loaded"] is False
+    await asyncio.wait_for(lyrics_requested.wait(), timeout=1)
+    release_lyrics.set()
+    await asyncio.sleep(0)
+    state = await plugin.get_player_state("session", joined["player_token"])
+
+    assert state["rounds"][0]["lyrics"] == "plain lyrics"
+    assert state["rounds"][0]["lrc_lyrics"] == "[00:01.00]synced lyrics"
+    assert state["rounds"][0]["lyrics_loaded"] is True
+    mass.metadata.get_track_lyrics.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_answer_reveal_does_not_wait_for_lyrics() -> None:
+    """Answer responses reveal the round without waiting for lyrics metadata."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    mass = cast("MagicMock", plugin.mass)
+    lyrics_requested = asyncio.Event()
+    release_lyrics = asyncio.Event()
+
+    async def delayed_lyrics(_track: Track) -> tuple[str, str]:
+        lyrics_requested.set()
+        await release_lyrics.wait()
+        return ("plain lyrics", "[00:01.00]synced lyrics")
+
+    mass.metadata.get_track_lyrics = AsyncMock(
+        side_effect=delayed_lyrics,
+    )
+    joined = await plugin.join_session("session", "Alice")
+    await plugin.start_session("session", _round_payload())
+
+    state = await asyncio.wait_for(
+        plugin.answer("session", joined["player_token"], "correct"),
+        timeout=1,
+    )
+
+    assert state["phase"] == BlindTestPhase.REVEAL
+    assert state["rounds"][0].get("lyrics") is None
+    assert state["rounds"][0]["lyrics_loaded"] is False
+    await asyncio.wait_for(lyrics_requested.wait(), timeout=1)
+    release_lyrics.set()
+    await asyncio.sleep(0)
+    revealed = await plugin.get_player_state("session", joined["player_token"])
+    assert revealed["rounds"][0]["lyrics"] == "plain lyrics"
+    assert revealed["rounds"][0]["lyrics_loaded"] is True
+    mass.metadata.get_track_lyrics.assert_awaited_once()
 
 
 @pytest.mark.asyncio
