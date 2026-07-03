@@ -59,6 +59,15 @@ def _create_plugin() -> BlindTestPlugin:
     plugin.mass.players.play_media = AsyncMock()
     plugin.mass.players.cmd_set_members = AsyncMock()
     plugin.mass.music.get_item_by_uri = AsyncMock(side_effect=_get_source_item_by_uri)
+    plugin.mass.music.search = AsyncMock(
+        return_value=SearchResults(
+            tracks=[
+                _track("wrong_1", "D.A.N.C.E.", "Justice"),
+                _track("wrong_2", "1999", "Cassius"),
+                _track("wrong_3", "Lady", "Modjo"),
+            ]
+        )
+    )
     plugin.mass.metadata.get_image_url_for_item = AsyncMock(return_value=None)
     plugin.mass.metadata.get_track_lyrics = AsyncMock(return_value=(None, None))
     plugin.mass.get_provider.return_value = None
@@ -76,6 +85,7 @@ def _create_plugin() -> BlindTestPlugin:
     plugin._lyrics_tasks = set()
     plugin._playback_attach_attempts = set()
     plugin._playback_leaders = {}
+    plugin._prepared_round_tasks = {}
     plugin._server_player_ids = {}
     plugin._unregister_handles = []
     return plugin
@@ -1356,6 +1366,54 @@ async def test_prepare_round_builds_suggestions_from_configured_source() -> None
     assert payload["duration"] == 180
     assert len(payload["suggestions"]) == 4
     assert sum(1 for item in payload["suggestions"] if item["is_correct"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_start_session_uses_prefetched_first_round() -> None:
+    """Starting a configured session should reuse the round prepared in the lobby."""
+    plugin = _create_plugin()
+    mass = cast("MagicMock", plugin.mass)
+    mass.music.get_item_by_uri = AsyncMock(
+        return_value=_track("source", "One More Time", "Daft Punk")
+    )
+    state = await plugin.create_session(
+        player_id="queue_1",
+        source_uris=["library://track/source"],
+    )
+    await plugin._prepared_round_tasks[(state["session_id"], 0)]
+    mass.music.search.reset_mock()
+
+    started = await plugin.start_session(state["session_id"])
+
+    assert started["rounds"][0]["track_uri"] == "library://track/source"
+    mass.music.search.assert_not_awaited()
+    mass.player_queues.play_media.assert_awaited_once_with(
+        queue_id="queue_1",
+        media="library://track/source",
+    )
+
+
+@pytest.mark.asyncio
+async def test_next_round_uses_prefetched_reveal_round() -> None:
+    """Next should reuse the round prepared while players are on the reveal screen."""
+    plugin = _create_plugin()
+    session = _session()
+    session.config.source_uris = ["library://track/source"]
+    plugin._sessions["session"] = session
+    mass = cast("MagicMock", plugin.mass)
+    mass.music.get_item_by_uri = AsyncMock(
+        return_value=_track("source", "One More Time", "Daft Punk")
+    )
+    await plugin.start_session("session", _round_payload(1))
+    await plugin.reveal("session")
+    await plugin._prepared_round_tasks[("session", 1)]
+    mass.music.search.reset_mock()
+
+    state = await plugin.next_round("session")
+
+    assert state["rounds"][1]["track_uri"] == "library://track/source"
+    mass.music.search.assert_not_awaited()
+    assert state["phase"] == BlindTestPhase.ANSWERING
 
 
 @pytest.mark.asyncio

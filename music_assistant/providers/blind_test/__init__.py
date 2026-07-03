@@ -114,6 +114,7 @@ class BlindTestPlugin(PluginProvider):
         self._lyrics_tasks: set[tuple[str, int, str]] = set()
         self._playback_attach_attempts: set[tuple[str, str, int, str]] = set()
         self._playback_leaders: dict[tuple[str, int], str] = {}
+        self._prepared_round_tasks: dict[tuple[str, int], asyncio.Task[dict[str, Any]]] = {}
         self._server_player_ids: dict[str, str] = {}
         self._unregister_handles: list[Callable[[], None]] = []
 
@@ -332,6 +333,7 @@ class BlindTestPlugin(PluginProvider):
             updated_at=time.time(),
         )
         self._sessions[session.session_id] = session
+        self._schedule_next_round_prepare(session)
         return _host_state(session)
 
     async def list_sessions(self) -> list[dict[str, Any]]:
@@ -466,10 +468,8 @@ class BlindTestPlugin(PluginProvider):
         :param round_payload: Prepared round payload.
         """
         session = self._get_session(session_id)
-        blind_test_round = _round_from_payload(
-            session,
-            round_payload or await self.prepare_round(session_id),
-        )
+        round_payload = await self._get_or_prepare_round_payload(session, round_payload)
+        blind_test_round = _round_from_payload(session, round_payload)
         start_round(session, blind_test_round, time.time())
         self._schedule_current_round_lyrics_hydration(session)
         _touch_session(session)
@@ -511,6 +511,107 @@ class BlindTestPlugin(PluginProvider):
             "suggestions": [suggestion.to_dict() for suggestion in suggestions],
         }
 
+    async def _get_or_prepare_round_payload(
+        self,
+        session: BlindTestSession,
+        round_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return an explicit, prefetched, or freshly prepared round payload."""
+        round_index = len(session.rounds)
+        if round_payload is not None:
+            self._discard_prepared_round_task(session.session_id, round_index)
+            return round_payload
+
+        task_key = (session.session_id, round_index)
+        if task := self._prepared_round_tasks.pop(task_key, None):
+            try:
+                return await task
+            except Exception as err:
+                self.logger.warning(
+                    "Failed to use prefetched Blind Test round %s for session %s: %s",
+                    round_index,
+                    session.session_id,
+                    err,
+                )
+        return await self.prepare_round(session.session_id)
+
+    def _schedule_next_round_prepare(self, session: BlindTestSession) -> None:
+        """Prepare the next round in the background to keep Start/Next responsive."""
+        if not session.config.source_uris:
+            return
+        round_index = len(session.rounds)
+        if round_index >= session.config.round_count:
+            return
+        task_key = (session.session_id, round_index)
+        if task_key in self._prepared_round_tasks:
+            return
+        task_id = f"blind_test_prepare_{session.session_id}_{round_index}"
+        task = self.mass.create_task(
+            self._prepare_round_prefetch,
+            session.session_id,
+            round_index,
+            task_id=task_id,
+        )
+
+        def handle_prepared_round_done(
+            finished_task: asyncio.Task[dict[str, Any]],
+        ) -> None:
+            self._handle_prepared_round_task_done(task_key, finished_task)
+
+        task.add_done_callback(handle_prepared_round_done)
+        self._prepared_round_tasks[task_key] = task
+
+    async def _prepare_round_prefetch(
+        self,
+        session_id: str,
+        round_index: int,
+    ) -> dict[str, Any]:
+        """Prepare one round payload for later Start/Next consumption."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise InvalidDataError("Session does not exist")
+        if len(session.rounds) != round_index:
+            raise InvalidDataError("Session round index changed before preparation started")
+        return await self.prepare_round(session_id)
+
+    def _handle_prepared_round_task_done(
+        self,
+        task_key: tuple[str, int],
+        task: asyncio.Task[dict[str, Any]],
+    ) -> None:
+        """Log background round preparation failures without dropping the cached task."""
+        if task.cancelled():
+            return
+        try:
+            err = task.exception()
+        except asyncio.CancelledError:
+            return
+        if err:
+            self.logger.warning(
+                "Failed to prepare Blind Test round %s for session %s: %s",
+                task_key[1],
+                task_key[0],
+                err,
+            )
+
+    def _discard_prepared_round_task(self, session_id: str, round_index: int) -> None:
+        """Discard one prefetched round task."""
+        task = self._prepared_round_tasks.pop((session_id, round_index), None)
+        if task and not task.done():
+            task.cancel()
+
+    def _clear_prepared_round_tasks(self, session_id: str) -> None:
+        """Discard all prefetched round tasks for a session."""
+        for task_key in [
+            task_key for task_key in self._prepared_round_tasks if task_key[0] == session_id
+        ]:
+            self._discard_prepared_round_task(*task_key)
+
+    def _clear_all_prepared_round_tasks(self) -> None:
+        """Discard all prefetched round tasks."""
+        for task_key in list(self._prepared_round_tasks):
+            self._discard_prepared_round_task(*task_key)
+
     async def answer(
         self,
         session_id: str,
@@ -541,6 +642,7 @@ class BlindTestPlugin(PluginProvider):
         """
         session = self._get_session(session_id)
         reveal_round(session)
+        self._schedule_next_round_prepare(session)
         self._schedule_current_round_lyrics_hydration(session)
         _touch_session(session)
         return _host_state(session)
@@ -595,6 +697,7 @@ class BlindTestPlugin(PluginProvider):
         session = self._get_session(session_id)
         await self._stop_playback(session)
         reset_session(session)
+        self._clear_prepared_round_tasks(session_id)
         self._clear_playback_attach_attempts(session_id)
         self._clear_playback_leaders(session_id)
         _touch_session(session)
@@ -611,6 +714,7 @@ class BlindTestPlugin(PluginProvider):
         await self._remove_server_playback_player(session_id)
         self._sessions.pop(session_id, None)
         self._advance_locks.pop(session_id, None)
+        self._clear_prepared_round_tasks(session_id)
         self._clear_playback_attach_attempts(session_id)
         self._clear_playback_leaders(session_id)
         self.mass.signal_event(
@@ -631,8 +735,7 @@ class BlindTestPlugin(PluginProvider):
             finish_session(session)
             _touch_session(session)
             return
-        if round_payload is None:
-            round_payload = await self.prepare_round(session.session_id)
+        round_payload = await self._get_or_prepare_round_payload(session, round_payload)
         blind_test_round = _round_from_payload(session, round_payload)
         await self._stop_playback(session)
         start_round(session, blind_test_round, time.time())
@@ -658,6 +761,7 @@ class BlindTestPlugin(PluginProvider):
         )
         self._lyrics_tasks.clear()
         self._playback_leaders.clear()
+        self._clear_all_prepared_round_tasks()
         self._server_player_ids.clear()
         self._sessions.clear()
         self._advance_locks.clear()
@@ -715,6 +819,7 @@ class BlindTestPlugin(PluginProvider):
         answer_deadline_reached = now >= current_round.started_at + round_duration
         if all_active_players_answered or answer_deadline_reached:
             reveal_round(session)
+            self._schedule_next_round_prepare(session)
             _touch_session(session)
 
     async def _sync_session_progress_and_schedule_lyrics(
