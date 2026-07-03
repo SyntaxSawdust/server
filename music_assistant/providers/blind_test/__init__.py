@@ -7,12 +7,17 @@ Provides the backend game engine for multiplayer blind test sessions.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import secrets
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from aiosendspin.models.core import ClientHelloPayload
+from aiosendspin.models.core import DeviceInfo as SendspinDeviceInfo
+from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.types import AudioCodec
 from music_assistant_models.auth import User, UserRole
 from music_assistant_models.enums import EventType, MediaType
 from music_assistant_models.errors import InvalidDataError
@@ -45,6 +50,13 @@ from music_assistant.providers.blind_test.suggestions import (
     build_answer_label,
     build_suggestions,
 )
+from music_assistant.providers.sendspin.bridge_role import (
+    BRIDGE_BIT_DEPTH,
+    BRIDGE_CHANNELS,
+    BRIDGE_ROLE_ID,
+    BRIDGE_SAMPLE_RATE,
+    BridgePlayerRole,
+)
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
@@ -59,6 +71,8 @@ SUPPORTED_FEATURES: set[ProviderFeature] = set()
 EVENT_SESSION_REMOVED = "blind_test_session_removed"
 BLIND_TEST_GUEST_USER = "blind_test_guest"
 BLIND_TEST_GUEST_DISPLAY_NAME = "Blind Test Guest"
+PLAYER_HEARTBEAT_TIMEOUT = 30
+SERVER_PLAYER_WAIT_TIMEOUT = 5.0
 
 
 async def setup(
@@ -98,6 +112,9 @@ class BlindTestPlugin(PluginProvider):
         self._sessions: dict[str, BlindTestSession] = {}
         self._advance_locks: dict[str, asyncio.Lock] = {}
         self._lyrics_tasks: set[tuple[str, int, str]] = set()
+        self._playback_attach_attempts: set[tuple[str, str, int, str]] = set()
+        self._playback_leaders: dict[tuple[str, int], str] = {}
+        self._server_player_ids: dict[str, str] = {}
         self._unregister_handles: list[Callable[[], None]] = []
 
     async def loaded_in_mass(self) -> None:
@@ -321,6 +338,7 @@ class BlindTestPlugin(PluginProvider):
         """Return live Blind Test session summaries."""
         summaries: list[dict[str, Any]] = []
         for session in self._sessions.values():
+            self._sync_stale_players(session)
             self._sync_answering_phase(session)
             summaries.append(_session_summary(session))
         return sorted(
@@ -336,7 +354,7 @@ class BlindTestPlugin(PluginProvider):
         :param session_id: Session ID to fetch.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase_and_schedule_lyrics(session)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         return _host_state(session)
 
     async def rename_session(self, session_id: str, name: str | None = None) -> dict[str, Any]:
@@ -358,7 +376,7 @@ class BlindTestPlugin(PluginProvider):
         :param session_id: Session ID to fetch.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase_and_schedule_lyrics(session)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         return _session_info(session)
 
     async def join_session(
@@ -375,6 +393,7 @@ class BlindTestPlugin(PluginProvider):
         :param sendspin_player_id: Temporary Sendspin player ID for this phone.
         """
         session = self._get_session(session_id)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         player_name = name.strip()
         if not player_name:
             raise InvalidDataError("Player name is required")
@@ -412,16 +431,26 @@ class BlindTestPlugin(PluginProvider):
         :param sendspin_player_id: Temporary Sendspin player ID for this phone.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase_and_schedule_lyrics(session)
         player = _get_player_by_token(session, player_token)
-        player.last_seen = time.time()
-        player.connected = True
+        was_connected = player.connected
+        _mark_player_seen(player)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         _touch_session(session)
         if sendspin_player_id:
             cleaned_sendspin_player_id = _clean_sendspin_player_id(sendspin_player_id)
+            sendspin_player_changed = cleaned_sendspin_player_id != player.sendspin_player_id
             if cleaned_sendspin_player_id != player.sendspin_player_id:
                 player.sendspin_player_id = cleaned_sendspin_player_id
-            await self._attach_player_to_current_playback(session, player)
+            if (
+                sendspin_player_changed
+                or not was_connected
+                or not self._has_playback_attach_attempt(
+                    session,
+                    player,
+                    cleaned_sendspin_player_id,
+                )
+            ):
+                await self._attach_player_to_current_playback(session, player)
         self._schedule_current_round_lyrics_hydration(session)
         return _player_state(session, player)
 
@@ -496,12 +525,12 @@ class BlindTestPlugin(PluginProvider):
         :param suggestion_id: Selected suggestion ID.
         """
         session = self._get_session(session_id)
-        self._sync_answering_phase_and_schedule_lyrics(session)
         player = _get_player_by_token(session, player_token)
+        _mark_player_seen(player)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         submit_answer(session, player.player_id, suggestion_id, time.time())
-        player.last_seen = time.time()
         _touch_session(session)
-        self._sync_answering_phase_and_schedule_lyrics(session)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         return _player_state(session, player)
 
     async def reveal(self, session_id: str) -> dict[str, Any]:
@@ -525,7 +554,8 @@ class BlindTestPlugin(PluginProvider):
         """
         session = self._get_session(session_id)
         player = _get_player_by_token(session, player_token)
-        player.last_seen = time.time()
+        _mark_player_seen(player)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         if session.phase != BlindTestPhase.REVEAL:
             _touch_session(session)
             return _player_state(session, player)
@@ -536,7 +566,7 @@ class BlindTestPlugin(PluginProvider):
             async with advance_lock:
                 if session.phase == BlindTestPhase.REVEAL and are_active_players_ready(session):
                     await self._advance_from_reveal(session)
-        self._schedule_current_round_lyrics_hydration(session)
+        await self._sync_session_progress_and_schedule_lyrics(session)
         return _player_state(session, player)
 
     async def next_round(
@@ -565,6 +595,8 @@ class BlindTestPlugin(PluginProvider):
         session = self._get_session(session_id)
         await self._stop_playback(session)
         reset_session(session)
+        self._clear_playback_attach_attempts(session_id)
+        self._clear_playback_leaders(session_id)
         _touch_session(session)
         return _host_state(session)
 
@@ -576,8 +608,11 @@ class BlindTestPlugin(PluginProvider):
         """
         session = self._get_session(session_id)
         await self._stop_playback(session)
+        await self._remove_server_playback_player(session_id)
         self._sessions.pop(session_id, None)
         self._advance_locks.pop(session_id, None)
+        self._clear_playback_attach_attempts(session_id)
+        self._clear_playback_leaders(session_id)
         self.mass.signal_event(
             EventType.UNKNOWN,
             object_id=session_id,
@@ -614,7 +649,16 @@ class BlindTestPlugin(PluginProvider):
         for unregister in self._unregister_handles:
             unregister()
         self._unregister_handles.clear()
+        await asyncio.gather(
+            *(
+                self._remove_server_playback_player(session_id)
+                for session_id in list(self._server_player_ids)
+            ),
+            return_exceptions=True,
+        )
         self._lyrics_tasks.clear()
+        self._playback_leaders.clear()
+        self._server_player_ids.clear()
         self._sessions.clear()
         self._advance_locks.clear()
         await super().unload(is_removed)
@@ -673,10 +717,37 @@ class BlindTestPlugin(PluginProvider):
             reveal_round(session)
             _touch_session(session)
 
-    def _sync_answering_phase_and_schedule_lyrics(self, session: BlindTestSession) -> None:
-        """Sync automatic reveal state and schedule active-round lyrics."""
-        self._sync_answering_phase(session)
+    async def _sync_session_progress_and_schedule_lyrics(
+        self,
+        session: BlindTestSession,
+    ) -> None:
+        """Sync automatic round progress and schedule active-round lyrics."""
+        await self._sync_session_progress(session)
         self._schedule_current_round_lyrics_hydration(session)
+
+    async def _sync_session_progress(self, session: BlindTestSession) -> None:
+        """Move a session forward when timers say the current round is done."""
+        self._sync_stale_players(session)
+        was_reveal = session.phase == BlindTestPhase.REVEAL
+        self._sync_answering_phase(session)
+        if was_reveal and self._is_reveal_track_finished(session):
+            advance_lock = self._advance_locks.setdefault(session.session_id, asyncio.Lock())
+            async with advance_lock:
+                if session.phase == BlindTestPhase.REVEAL and self._is_reveal_track_finished(
+                    session
+                ):
+                    await self._advance_from_reveal(session)
+
+    def _is_reveal_track_finished(self, session: BlindTestSession) -> bool:
+        """Return whether the revealed track has reached its known duration."""
+        if session.phase != BlindTestPhase.REVEAL:
+            return False
+        current_round = get_current_round(session)
+        if current_round.started_at is None:
+            return False
+        if current_round.duration is None or current_round.duration <= 0:
+            return False
+        return time.time() >= current_round.started_at + current_round.duration
 
     def _schedule_current_round_lyrics_hydration(self, session: BlindTestSession) -> None:
         """Fetch current round lyrics in the background without blocking players."""
@@ -704,6 +775,22 @@ class BlindTestPlugin(PluginProvider):
         except Exception:
             self._lyrics_tasks.discard(task_key)
             raise
+
+    def _sync_stale_players(self, session: BlindTestSession) -> None:
+        """Mark players disconnected when they have stopped polling."""
+        now = time.time()
+        changed = False
+        for player in session.players.values():
+            if not player.connected:
+                continue
+            if player.last_seen <= 0:
+                continue
+            if now - player.last_seen <= PLAYER_HEARTBEAT_TIMEOUT:
+                continue
+            player.connected = False
+            changed = True
+        if changed:
+            _touch_session(session)
 
     async def _hydrate_current_round_lyrics(
         self,
@@ -759,6 +846,7 @@ class BlindTestPlugin(PluginProvider):
         """Start playback for the current round."""
         current_round = session.rounds[session.current_round_index or 0]
         playback_targets: list[tuple[str, bool]] = []
+        fallback_phone_player_ids: set[str] = set()
         selected_player_id = self._get_selected_playback_player_id(session)
         phone_player_ids: set[str] = set()
         if session.config.play_on_joined_players:
@@ -774,51 +862,241 @@ class BlindTestPlugin(PluginProvider):
             }
             if session.config.play_on_player:
                 phone_player_ids.discard(session.config.player_id)
+        round_phone_player_ids = set(phone_player_ids)
 
         if selected_player_id:
             grouped_phone_ids = await self._sync_playback_targets(
                 selected_player_id,
                 phone_player_ids,
             )
+            fallback_phone_player_ids.update(grouped_phone_ids)
             phone_player_ids -= grouped_phone_ids
             playback_targets.append((selected_player_id, False))
         elif phone_player_ids:
-            selected_player_id = sorted(phone_player_ids)[0]
-            phone_player_ids.remove(selected_player_id)
-            grouped_phone_ids = await self._sync_playback_targets(
-                selected_player_id,
-                phone_player_ids,
-            )
-            phone_player_ids -= grouped_phone_ids
-            playback_targets.append((selected_player_id, True))
+            selected_player_id = await self._get_or_create_server_playback_player_id(session)
+            if selected_player_id:
+                grouped_phone_ids = await self._sync_playback_targets(
+                    selected_player_id,
+                    phone_player_ids,
+                )
+                fallback_phone_player_ids.update(grouped_phone_ids)
+                phone_player_ids -= grouped_phone_ids
+                is_phone_player = False
+            else:
+                selected_player_id = sorted(phone_player_ids)[0]
+                phone_player_ids.remove(selected_player_id)
+                grouped_phone_ids = await self._sync_playback_targets(
+                    selected_player_id,
+                    phone_player_ids,
+                )
+                fallback_phone_player_ids.update(grouped_phone_ids)
+                phone_player_ids -= grouped_phone_ids
+                is_phone_player = True
+            playback_targets.append((selected_player_id, is_phone_player))
 
         playback_targets.extend((player_id, True) for player_id in sorted(phone_player_ids))
         if not playback_targets:
             raise InvalidDataError("No playback targets are available")
+        self._mark_playback_attach_attempts_for_sendspin_ids(
+            session,
+            round_phone_player_ids,
+        )
 
         playback_errors: list[Exception] = []
+        successful_targets = await self._play_media_on_targets(
+            current_round.track_uri,
+            playback_targets,
+            playback_errors,
+        )
+        if not successful_targets and fallback_phone_player_ids:
+            fallback_phone_player_ids.difference_update(
+                player_id for player_id, _is_phone_player in playback_targets
+            )
+            fallback_targets = [
+                player_id
+                for player_id in sorted(fallback_phone_player_ids)
+                if self._get_available_sendspin_player_id(player_id)
+            ]
+            if fallback_targets:
+                fallback_leader_id = fallback_targets[0]
+                await self._sync_playback_targets(
+                    fallback_leader_id,
+                    set(fallback_targets[1:]),
+                )
+                successful_targets = await self._play_media_on_targets(
+                    current_round.track_uri,
+                    [(player_id, True) for player_id in fallback_targets],
+                    playback_errors,
+                    fallback=True,
+                    stop_after_success=True,
+                )
+        if not successful_targets:
+            raise InvalidDataError("No playback targets are available") from (
+                playback_errors[0] if playback_errors else None
+            )
+        self._set_current_playback_leader(session, successful_targets[0])
+
+    async def _play_media_on_targets(
+        self,
+        track_uri: str,
+        playback_targets: list[tuple[str, bool]],
+        playback_errors: list[Exception],
+        *,
+        fallback: bool = False,
+        stop_after_success: bool = False,
+    ) -> list[str]:
+        """Try to start playback on targets and return the successful target IDs."""
+        successful_targets: list[str] = []
         for player_id, is_phone_player in playback_targets:
             try:
                 await self.mass.player_queues.play_media(
                     queue_id=player_id,
-                    media=current_round.track_uri,
+                    media=track_uri,
                 )
+                successful_targets.append(player_id)
+                if stop_after_success:
+                    break
             except Exception as err:
                 playback_errors.append(err)
-                player_type = "temporary phone" if is_phone_player else "selected"
+                player_type = (
+                    "fallback temporary phone"
+                    if fallback
+                    else "temporary phone"
+                    if is_phone_player
+                    else "selected"
+                )
                 self.logger.warning(
                     "Failed to play Blind Test round on %s player %s: %s",
                     player_type,
                     player_id,
                     err,
                 )
-        if len(playback_errors) == len(playback_targets):
-            raise playback_errors[0]
+        return successful_targets
+
+    async def _get_or_create_server_playback_player_id(
+        self,
+        session: BlindTestSession,
+    ) -> str | None:
+        """Return a hidden server-owned Sendspin player for stable phone-only playback."""
+        sendspin_provider = self.mass.get_provider("sendspin")
+        server_api = getattr(sendspin_provider, "server_api", None)
+        if server_api is None:
+            self.logger.debug("Sendspin provider is not available for Blind Test server playback")
+            return None
+
+        player_id = _server_playback_player_id(session.session_id)
+        self._server_player_ids[session.session_id] = player_id
+        if server_api.get_client(player_id) is None:
+            self._register_server_playback_player(server_api, player_id, session)
+        return await self._wait_for_server_playback_player(player_id)
+
+    def _register_server_playback_player(
+        self,
+        server_api: Any,
+        player_id: str,
+        session: BlindTestSession,
+    ) -> None:
+        """Register a silent server-owned Sendspin player for a Blind Test session."""
+        session_name = session.config.name or "Blind Test"
+        hello = ClientHelloPayload(
+            client_id=player_id,
+            name=f"{session_name} Server",
+            version=1,
+            supported_roles=[BRIDGE_ROLE_ID, "player@v1"],
+            device_info=SendspinDeviceInfo(
+                product_name="Blind Test Server",
+                manufacturer="Music Assistant",
+            ),
+            player_support=ClientHelloPlayerSupport(
+                supported_formats=[
+                    SupportedAudioFormat(
+                        codec=AudioCodec.PCM,
+                        channels=BRIDGE_CHANNELS,
+                        sample_rate=BRIDGE_SAMPLE_RATE,
+                        bit_depth=BRIDGE_BIT_DEPTH,
+                    )
+                ],
+                buffer_capacity=1_000,
+                supported_commands=[],
+            ),
+        )
+        sendspin_client = server_api.register_external_player(
+            hello,
+            on_stream_start=self._on_server_playback_stream_start,
+        )
+        for role in sendspin_client.roles_by_family("player"):
+            if not isinstance(role, BridgePlayerRole):
+                continue
+            role.set_callbacks(
+                on_audio_chunk=self._ignore_server_audio_chunk,
+                on_volume_change=self._ignore_server_volume_change,
+                on_mute_change=self._ignore_server_mute_change,
+                on_stream_start=self._on_server_playback_stream_started,
+                on_stream_end=self._on_server_playback_stream_ended,
+                initial_volume=0,
+            )
+            role.setup_audio_requirements(
+                sample_rate=BRIDGE_SAMPLE_RATE,
+                bit_depth=BRIDGE_BIT_DEPTH,
+                channels=BRIDGE_CHANNELS,
+            )
+            role.set_timing(required_lead_time_ms=0, min_buffer_ms=0)
+            break
+
+    async def _wait_for_server_playback_player(self, player_id: str) -> str | None:
+        """Wait until the hidden server Sendspin player has a MA queue."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + SERVER_PLAYER_WAIT_TIMEOUT
+        while loop.time() < deadline:
+            player = self.mass.players.get_player(player_id)
+            queue = self.mass.player_queues.get(player_id)
+            if player is not None and queue is not None:
+                return player_id
+            await asyncio.sleep(0.1)
+        self.logger.warning("Timed out waiting for Blind Test server player %s", player_id)
+        return None
+
+    async def _remove_server_playback_player(self, session_id: str) -> None:
+        """Remove the hidden server-owned Sendspin player for a session."""
+        player_id = self._server_player_ids.pop(
+            session_id,
+            _server_playback_player_id(session_id),
+        )
+        sendspin_provider = self.mass.get_provider("sendspin")
+        server_api = getattr(sendspin_provider, "server_api", None)
+        if server_api is None or server_api.get_client(player_id) is None:
+            return
+        with contextlib.suppress(Exception):
+            await server_api.remove_client(player_id)
+
+    def _on_server_playback_stream_start(self, _request: Any) -> None:
+        """Accept Sendspin stream start requests for the silent server player."""
+
+    def _on_server_playback_stream_started(self) -> None:
+        """Handle silent server playback stream start."""
+
+    def _on_server_playback_stream_ended(self) -> None:
+        """Handle silent server playback stream end."""
+
+    def _ignore_server_audio_chunk(self, _chunk: Any) -> None:
+        """Discard audio that is only needed to keep the server-owned group alive."""
+
+    def _ignore_server_volume_change(self, _volume: int) -> None:
+        """Ignore volume changes for the silent server playback player."""
+
+    def _ignore_server_mute_change(self, _muted: bool) -> None:
+        """Ignore mute changes for the silent server playback player."""
 
     async def _stop_playback(self, session: BlindTestSession) -> None:
         """Stop every playback target used by the session."""
         player_ids = self._get_playback_target_ids(session)
-        for player_id in sorted(player_ids):
+        leader_id = self._get_tracked_playback_leader(session)
+        ordered_player_ids = []
+        if leader_id:
+            ordered_player_ids.append(leader_id)
+            player_ids.discard(leader_id)
+        ordered_player_ids.extend(sorted(player_ids))
+        for player_id in ordered_player_ids:
             try:
                 await self.mass.player_queues.stop(player_id)
             except Exception as err:
@@ -894,11 +1172,109 @@ class BlindTestPlugin(PluginProvider):
         if not sendspin_player_id:
             return
         leader_id = self._get_current_playback_leader_id(session, sendspin_player_id)
-        if not leader_id or not self._can_group_players(leader_id, sendspin_player_id):
+        if not leader_id:
+            return
+        if self._has_playback_attach_attempt(session, player, sendspin_player_id):
+            return
+        self._mark_playback_attach_attempt(session, player, sendspin_player_id)
+        if not self._can_group_players(leader_id, sendspin_player_id):
             return
         if self._is_player_already_synced(leader_id, sendspin_player_id):
             return
         await self._sync_playback_targets(leader_id, {sendspin_player_id})
+
+    def _has_playback_attach_attempt(
+        self,
+        session: BlindTestSession,
+        player: BlindTestPlayer,
+        sendspin_player_id: str | None,
+    ) -> bool:
+        """Return whether this phone already had a playback attach attempt."""
+        if not sendspin_player_id:
+            return False
+        return (
+            self._playback_attach_key(session, player, sendspin_player_id)
+            in self._playback_attach_attempts
+        )
+
+    def _mark_playback_attach_attempt(
+        self,
+        session: BlindTestSession,
+        player: BlindTestPlayer,
+        sendspin_player_id: str,
+    ) -> None:
+        """Remember an attach attempt so polling does not churn Sendspin groups."""
+        self._playback_attach_attempts.add(
+            self._playback_attach_key(session, player, sendspin_player_id)
+        )
+
+    def _mark_playback_attach_attempts_for_sendspin_ids(
+        self,
+        session: BlindTestSession,
+        sendspin_player_ids: set[str],
+    ) -> None:
+        """Remember round-start attach attempts for all phone playback targets."""
+        for player in session.players.values():
+            if (
+                not player.sendspin_player_id
+                or player.sendspin_player_id not in sendspin_player_ids
+            ):
+                continue
+            self._mark_playback_attach_attempt(
+                session,
+                player,
+                player.sendspin_player_id,
+            )
+
+    def _playback_attach_key(
+        self,
+        session: BlindTestSession,
+        player: BlindTestPlayer,
+        sendspin_player_id: str,
+    ) -> tuple[str, str, int, str]:
+        """Return the stable key for a phone attach attempt in the current round."""
+        return (
+            session.session_id,
+            player.player_id,
+            session.current_round_index if session.current_round_index is not None else -1,
+            sendspin_player_id,
+        )
+
+    def _clear_playback_attach_attempts(self, session_id: str) -> None:
+        """Forget attach attempts for a session that is no longer using them."""
+        self._playback_attach_attempts = {
+            key for key in self._playback_attach_attempts if key[0] != session_id
+        }
+
+    def _set_current_playback_leader(
+        self,
+        session: BlindTestSession,
+        player_id: str,
+    ) -> None:
+        """Remember the player that owns the current round playback stream."""
+        self._playback_leaders[self._playback_round_key(session)] = player_id
+
+    def _get_tracked_playback_leader(
+        self,
+        session: BlindTestSession,
+    ) -> str | None:
+        """Return the tracked playback leader for the active round."""
+        return self._playback_leaders.get(self._playback_round_key(session))
+
+    def _playback_round_key(self, session: BlindTestSession) -> tuple[str, int]:
+        """Return the stable key for active round playback bookkeeping."""
+        return (
+            session.session_id,
+            session.current_round_index if session.current_round_index is not None else -1,
+        )
+
+    def _clear_playback_leaders(self, session_id: str) -> None:
+        """Forget tracked playback leaders for a session."""
+        self._playback_leaders = {
+            key: player_id
+            for key, player_id in self._playback_leaders.items()
+            if key[0] != session_id
+        }
 
     async def _get_next_source_track(self, session: BlindTestSession) -> Track:
         """Return a random unused track from configured sources."""
@@ -925,6 +1301,10 @@ class BlindTestPlugin(PluginProvider):
 
     def _can_group_players(self, leader_id: str, child_id: str) -> bool:
         """Return whether MA reports that the child can join the leader."""
+        if _is_blind_test_sendspin_player_id(leader_id) and _is_blind_test_sendspin_player_id(
+            child_id
+        ):
+            return True
         leader = self.mass.players.get_player(leader_id)
         child = self.mass.players.get_player(child_id)
         if leader is None or child is None:
@@ -979,6 +1359,14 @@ class BlindTestPlugin(PluginProvider):
         selected_player_id = self._get_selected_playback_player_id(session)
         if selected_player_id and selected_player_id != child_player_id:
             return selected_player_id
+        tracked_leader_id = self._get_tracked_playback_leader(session)
+        if tracked_leader_id == child_player_id:
+            return None
+        if tracked_leader_id and (
+            not _is_blind_test_sendspin_player_id(tracked_leader_id)
+            or self._get_available_sendspin_player_id(tracked_leader_id)
+        ):
+            return tracked_leader_id
         phone_player_ids = []
         for player in session.players.values():
             if not player.connected:
@@ -1030,6 +1418,12 @@ def _is_blind_test_sendspin_player_id(player_id: str) -> bool:
     return player_id.startswith("blind_test_")
 
 
+def _server_playback_player_id(session_id: str) -> str:
+    """Return the hidden server-owned Sendspin player ID for a session."""
+    safe_session_id = _clean_sendspin_player_id(session_id) or "session"
+    return f"blind_test_{safe_session_id}_server"
+
+
 def _clean_session_name(name: str | None) -> str | None:
     """Return a normalized optional session name."""
     if not name:
@@ -1066,6 +1460,12 @@ def _round_from_payload(
 def _touch_session(session: BlindTestSession) -> None:
     """Mark a session as updated."""
     session.updated_at = time.time()
+
+
+def _mark_player_seen(player: BlindTestPlayer) -> None:
+    """Record that a player has an active web client connection."""
+    player.last_seen = time.time()
+    player.connected = True
 
 
 def _session_summary(session: BlindTestSession) -> dict[str, Any]:
