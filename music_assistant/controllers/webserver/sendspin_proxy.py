@@ -202,15 +202,36 @@ class SendspinProxyHandler:
             self._forward_internal_to_client(client_ws, internal_ws)
         )
 
-        _done, pending = await asyncio.wait(
+        done, pending = await asyncio.wait(
             [client_to_internal, internal_to_client],
             return_when=asyncio.FIRST_COMPLETED,
         )
 
-        for task in pending:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        try:
+            for task in done:
+                self._handle_proxy_task_exception(task)
+        finally:
+            for task in pending:
+                task.cancel()
+            results = await asyncio.gather(*pending, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    self._handle_proxy_exception(result)
+
+    def _handle_proxy_task_exception(self, task: asyncio.Task[None]) -> None:
+        """Handle a completed proxy forwarding task."""
+        with contextlib.suppress(asyncio.CancelledError):
+            if exc := task.exception():
+                self._handle_proxy_exception(exc)
+
+    def _handle_proxy_exception(self, exc: BaseException) -> None:
+        """Handle proxy forwarding exceptions."""
+        if isinstance(exc, asyncio.CancelledError):
+            return
+        if isinstance(exc, ConnectionError):
+            self.logger.debug("Sendspin proxy connection closed while forwarding: %s", exc)
+            return
+        raise exc
 
     async def _forward_client_to_internal(
         self,

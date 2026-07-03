@@ -71,6 +71,7 @@ SUPPORTED_FEATURES: set[ProviderFeature] = set()
 EVENT_SESSION_REMOVED = "blind_test_session_removed"
 BLIND_TEST_GUEST_USER = "blind_test_guest"
 BLIND_TEST_GUEST_DISPLAY_NAME = "Blind Test Guest"
+BLIND_TEST_JOIN_CODE_EXPIRY_HOURS = 8
 PLAYER_HEARTBEAT_TIMEOUT = 30
 SERVER_PLAYER_WAIT_TIMEOUT = 5.0
 
@@ -115,6 +116,7 @@ class BlindTestPlugin(PluginProvider):
         self._playback_attach_attempts: set[tuple[str, str, int, str]] = set()
         self._playback_leaders: dict[tuple[str, int], str] = {}
         self._prepared_round_tasks: dict[tuple[str, int], asyncio.Task[dict[str, Any]]] = {}
+        self._join_code_expires_at: dict[str, float] = {}
         self._server_player_ids: dict[str, str] = {}
         self._unregister_handles: list[Callable[[], None]] = []
 
@@ -248,22 +250,55 @@ class BlindTestPlugin(PluginProvider):
         self.logger.info("Created Blind Test guest user account")
         return user
 
-    async def _get_join_code(self) -> str:
-        """Return an active auth join code for Blind Test guests."""
+    async def _generate_join_code(self) -> tuple[str, float]:
+        """Generate a fresh auth join code for Blind Test guests."""
         auth = self.mass.webserver.auth
         guest_user = await self._get_or_create_blind_test_guest_user()
 
-        existing_code = await auth.get_active_join_code(guest_user)
-        if existing_code:
-            return existing_code
-
         code, _expires_at = await auth.generate_join_code(
             user=guest_user,
-            expires_in_hours=8,
+            expires_in_hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS,
             max_uses=0,
             device_name="Blind Test Guest",
         )
+        return code, _expires_at.timestamp()
+
+    async def _get_join_code_expiry(self, code: str) -> float | None:
+        """Return the expiry timestamp for an active Blind Test join code."""
+        auth = self.mass.webserver.auth
+        guest_user = await self._get_or_create_blind_test_guest_user()
+        expires_at = await auth.get_join_code_expiry(code, guest_user)
+        return expires_at.timestamp() if expires_at else None
+
+    async def _get_join_code(self) -> str:
+        """Generate and return a fresh auth join code for Blind Test guests."""
+        code, _expires_at = await self._generate_join_code()
         return code
+
+    async def _ensure_session_join_code(
+        self,
+        session: BlindTestSession,
+    ) -> None:
+        """Refresh a session join code if that session's stored auth code expired."""
+        now = time.time()
+        join_code_changed = False
+        expires_at = self._join_code_expires_at.get(session.session_id)
+
+        if expires_at is None:
+            expires_at = await self._get_join_code_expiry(session.join_code)
+            if expires_at is not None:
+                self._join_code_expires_at[session.session_id] = expires_at
+
+        if expires_at is None or expires_at <= now:
+            session.join_code, expires_at = await self._generate_join_code()
+            self._join_code_expires_at[session.session_id] = expires_at
+            join_code_changed = True
+
+        join_url = self._build_join_url(session.session_id, session.join_code)
+        if not join_code_changed and join_url == session.join_url:
+            return
+        session.join_url = join_url
+        _touch_session(session)
 
     def _build_join_url(self, session_id: str, code: str) -> str:
         """Build a guest-authenticated URL for a Blind Test session."""
@@ -282,9 +317,8 @@ class BlindTestPlugin(PluginProvider):
     async def get_join_url(self, session_id: str) -> str:
         """Return a guest-authenticated join URL for a Blind Test session."""
         session = self._get_session(session_id)
-        session.join_code = await self._get_join_code()
-        session.join_url = self._build_join_url(session.session_id, session.join_code)
-        _touch_session(session)
+        await self._ensure_session_join_code(session)
+        assert session.join_url is not None
         return session.join_url
 
     async def create_session(
@@ -322,7 +356,7 @@ class BlindTestPlugin(PluginProvider):
         )
         _validate_config(config)
         session_id = secrets.token_urlsafe(12)
-        join_code = await self._get_join_code()
+        join_code, join_code_expires_at = await self._generate_join_code()
         session = BlindTestSession(
             session_id=session_id,
             join_code=join_code,
@@ -333,6 +367,7 @@ class BlindTestPlugin(PluginProvider):
             updated_at=time.time(),
         )
         self._sessions[session.session_id] = session
+        self._join_code_expires_at[session.session_id] = join_code_expires_at
         self._schedule_next_round_prepare(session)
         return _host_state(session)
 
@@ -356,6 +391,7 @@ class BlindTestPlugin(PluginProvider):
         :param session_id: Session ID to fetch.
         """
         session = self._get_session(session_id)
+        await self._ensure_session_join_code(session)
         await self._sync_session_progress_and_schedule_lyrics(session)
         return _host_state(session)
 
@@ -378,6 +414,7 @@ class BlindTestPlugin(PluginProvider):
         :param session_id: Session ID to fetch.
         """
         session = self._get_session(session_id)
+        await self._ensure_session_join_code(session)
         await self._sync_session_progress_and_schedule_lyrics(session)
         return _session_info(session)
 
@@ -436,6 +473,7 @@ class BlindTestPlugin(PluginProvider):
         player = _get_player_by_token(session, player_token)
         was_connected = player.connected
         _mark_player_seen(player)
+        await self._ensure_session_join_code(session)
         await self._sync_session_progress_and_schedule_lyrics(session)
         _touch_session(session)
         if sendspin_player_id:
@@ -470,10 +508,7 @@ class BlindTestPlugin(PluginProvider):
         session = self._get_session(session_id)
         round_payload = await self._get_or_prepare_round_payload(session, round_payload)
         blind_test_round = _round_from_payload(session, round_payload)
-        start_round(session, blind_test_round, time.time())
-        self._schedule_current_round_lyrics_hydration(session)
-        _touch_session(session)
-        await self._play_round(session)
+        await self._start_round_with_playback(session, blind_test_round)
         return _host_state(session)
 
     async def prepare_round(self, session_id: str) -> dict[str, Any]:
@@ -714,6 +749,7 @@ class BlindTestPlugin(PluginProvider):
         await self._remove_server_playback_player(session_id)
         self._sessions.pop(session_id, None)
         self._advance_locks.pop(session_id, None)
+        self._join_code_expires_at.pop(session_id, None)
         self._clear_prepared_round_tasks(session_id)
         self._clear_playback_attach_attempts(session_id)
         self._clear_playback_leaders(session_id)
@@ -738,10 +774,29 @@ class BlindTestPlugin(PluginProvider):
         round_payload = await self._get_or_prepare_round_payload(session, round_payload)
         blind_test_round = _round_from_payload(session, round_payload)
         await self._stop_playback(session)
+        await self._start_round_with_playback(session, blind_test_round)
+
+    async def _start_round_with_playback(
+        self,
+        session: BlindTestSession,
+        blind_test_round: BlindTestRound,
+    ) -> None:
+        """Start playback before exposing the answering round to players."""
+        try:
+            await self._play_round(
+                session,
+                track_uri=blind_test_round.track_uri,
+                round_index=blind_test_round.round_index,
+            )
+        except Exception:
+            self._clear_playback_attach_attempts_for_round(
+                session.session_id,
+                blind_test_round.round_index,
+            )
+            raise
         start_round(session, blind_test_round, time.time())
         self._schedule_current_round_lyrics_hydration(session)
         _touch_session(session)
-        await self._play_round(session)
 
     async def unload(self, is_removed: bool = False) -> None:
         """
@@ -762,6 +817,7 @@ class BlindTestPlugin(PluginProvider):
         self._lyrics_tasks.clear()
         self._playback_leaders.clear()
         self._clear_all_prepared_round_tasks()
+        self._join_code_expires_at.clear()
         self._server_player_ids.clear()
         self._sessions.clear()
         self._advance_locks.clear()
@@ -947,9 +1003,17 @@ class BlindTestPlugin(PluginProvider):
         finally:
             self._lyrics_tasks.discard(task_key)
 
-    async def _play_round(self, session: BlindTestSession) -> None:
+    async def _play_round(
+        self,
+        session: BlindTestSession,
+        track_uri: str | None = None,
+        round_index: int | None = None,
+    ) -> None:
         """Start playback for the current round."""
-        current_round = session.rounds[session.current_round_index or 0]
+        if track_uri is None or round_index is None:
+            current_round = session.rounds[session.current_round_index or 0]
+            track_uri = current_round.track_uri
+            round_index = current_round.round_index
         playback_targets: list[tuple[str, bool]] = []
         fallback_phone_player_ids: set[str] = set()
         selected_player_id = self._get_selected_playback_player_id(session)
@@ -1005,11 +1069,12 @@ class BlindTestPlugin(PluginProvider):
         self._mark_playback_attach_attempts_for_sendspin_ids(
             session,
             round_phone_player_ids,
+            round_index,
         )
 
         playback_errors: list[Exception] = []
         successful_targets = await self._play_media_on_targets(
-            current_round.track_uri,
+            track_uri,
             playback_targets,
             playback_errors,
         )
@@ -1029,7 +1094,7 @@ class BlindTestPlugin(PluginProvider):
                     set(fallback_targets[1:]),
                 )
                 successful_targets = await self._play_media_on_targets(
-                    current_round.track_uri,
+                    track_uri,
                     [(player_id, True) for player_id in fallback_targets],
                     playback_errors,
                     fallback=True,
@@ -1039,7 +1104,7 @@ class BlindTestPlugin(PluginProvider):
             raise InvalidDataError("No playback targets are available") from (
                 playback_errors[0] if playback_errors else None
             )
-        self._set_current_playback_leader(session, successful_targets[0])
+        self._set_current_playback_leader(session, successful_targets[0], round_index)
 
     async def _play_media_on_targets(
         self,
@@ -1307,16 +1372,18 @@ class BlindTestPlugin(PluginProvider):
         session: BlindTestSession,
         player: BlindTestPlayer,
         sendspin_player_id: str,
+        round_index: int | None = None,
     ) -> None:
         """Remember an attach attempt so polling does not churn Sendspin groups."""
         self._playback_attach_attempts.add(
-            self._playback_attach_key(session, player, sendspin_player_id)
+            self._playback_attach_key(session, player, sendspin_player_id, round_index)
         )
 
     def _mark_playback_attach_attempts_for_sendspin_ids(
         self,
         session: BlindTestSession,
         sendspin_player_ids: set[str],
+        round_index: int | None = None,
     ) -> None:
         """Remember round-start attach attempts for all phone playback targets."""
         for player in session.players.values():
@@ -1329,6 +1396,7 @@ class BlindTestPlugin(PluginProvider):
                 session,
                 player,
                 player.sendspin_player_id,
+                round_index,
             )
 
     def _playback_attach_key(
@@ -1336,14 +1404,31 @@ class BlindTestPlugin(PluginProvider):
         session: BlindTestSession,
         player: BlindTestPlayer,
         sendspin_player_id: str,
+        round_index: int | None = None,
     ) -> tuple[str, str, int, str]:
         """Return the stable key for a phone attach attempt in the current round."""
         return (
             session.session_id,
             player.player_id,
-            session.current_round_index if session.current_round_index is not None else -1,
+            round_index
+            if round_index is not None
+            else session.current_round_index
+            if session.current_round_index is not None
+            else -1,
             sendspin_player_id,
         )
+
+    def _clear_playback_attach_attempts_for_round(
+        self,
+        session_id: str,
+        round_index: int,
+    ) -> None:
+        """Forget attach attempts for a failed round start."""
+        self._playback_attach_attempts = {
+            key
+            for key in self._playback_attach_attempts
+            if key[0] != session_id or key[2] != round_index
+        }
 
     def _clear_playback_attach_attempts(self, session_id: str) -> None:
         """Forget attach attempts for a session that is no longer using them."""
@@ -1355,9 +1440,10 @@ class BlindTestPlugin(PluginProvider):
         self,
         session: BlindTestSession,
         player_id: str,
+        round_index: int | None = None,
     ) -> None:
         """Remember the player that owns the current round playback stream."""
-        self._playback_leaders[self._playback_round_key(session)] = player_id
+        self._playback_leaders[self._playback_round_key(session, round_index)] = player_id
 
     def _get_tracked_playback_leader(
         self,
@@ -1366,11 +1452,19 @@ class BlindTestPlugin(PluginProvider):
         """Return the tracked playback leader for the active round."""
         return self._playback_leaders.get(self._playback_round_key(session))
 
-    def _playback_round_key(self, session: BlindTestSession) -> tuple[str, int]:
+    def _playback_round_key(
+        self,
+        session: BlindTestSession,
+        round_index: int | None = None,
+    ) -> tuple[str, int]:
         """Return the stable key for active round playback bookkeeping."""
         return (
             session.session_id,
-            session.current_round_index if session.current_round_index is not None else -1,
+            round_index
+            if round_index is not None
+            else session.current_round_index
+            if session.current_round_index is not None
+            else -1,
         )
 
     def _clear_playback_leaders(self, session_id: str) -> None:

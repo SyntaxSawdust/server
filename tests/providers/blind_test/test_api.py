@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -20,7 +21,12 @@ from music_assistant_models.media_items import (
     UniqueList,
 )
 
-from music_assistant.providers.blind_test import BlindTestPlugin, get_config_entries
+from music_assistant.helpers.datetime import utc
+from music_assistant.providers.blind_test import (
+    BLIND_TEST_JOIN_CODE_EXPIRY_HOURS,
+    BlindTestPlugin,
+    get_config_entries,
+)
 from music_assistant.providers.blind_test.models import (
     BlindTestConfig,
     BlindTestPhase,
@@ -78,7 +84,12 @@ def _create_plugin() -> BlindTestPlugin:
     )
     plugin.mass.webserver.auth.create_user = AsyncMock()
     plugin.mass.webserver.auth.get_active_join_code = AsyncMock(return_value="BTJOIN")
-    plugin.mass.webserver.auth.generate_join_code = AsyncMock(return_value=("BTJOIN", None))
+    plugin.mass.webserver.auth.get_join_code_expiry = AsyncMock(
+        return_value=utc() + timedelta(hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS)
+    )
+    plugin.mass.webserver.auth.generate_join_code = AsyncMock(
+        return_value=("BTJOIN", utc() + timedelta(hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS))
+    )
     plugin.logger = MagicMock()
     plugin._sessions = {}
     plugin._advance_locks = {}
@@ -86,6 +97,7 @@ def _create_plugin() -> BlindTestPlugin:
     plugin._playback_attach_attempts = set()
     plugin._playback_leaders = {}
     plugin._prepared_round_tasks = {}
+    plugin._join_code_expires_at = {}
     plugin._server_player_ids = {}
     plugin._unregister_handles = []
     return plugin
@@ -378,6 +390,106 @@ async def test_create_session_returns_host_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_blind_test_join_code_uses_standard_guest_invite_expiry() -> None:
+    """Blind Test join codes use normal short-code expiry and unlimited uses."""
+    plugin = _create_plugin()
+    mass = cast("MagicMock", plugin.mass)
+
+    code = await plugin._get_join_code()
+
+    assert code == "BTJOIN"
+    mass.webserver.auth.generate_join_code.assert_awaited_once_with(
+        user=mass.webserver.auth.get_user_by_username.return_value,
+        expires_in_hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS,
+        max_uses=0,
+        device_name="Blind Test Guest",
+    )
+    mass.webserver.auth.get_active_join_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_session_generates_fresh_join_code_per_session() -> None:
+    """Each new Blind Test session gets its own guest invite code."""
+    plugin = _create_plugin()
+    mass = cast("MagicMock", plugin.mass)
+    mass.webserver.auth.generate_join_code = AsyncMock(
+        side_effect=[
+            ("JOIN1", utc() + timedelta(hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS)),
+            ("JOIN2", utc() + timedelta(hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS)),
+        ]
+    )
+
+    first = await plugin.create_session(player_id="queue_1", source_uris=["library://track/1"])
+    second = await plugin.create_session(player_id="queue_1", source_uris=["library://track/1"])
+
+    assert first["join_code"] == "JOIN1"
+    assert second["join_code"] == "JOIN2"
+    assert first["join_url"] != second["join_url"]
+    assert mass.webserver.auth.generate_join_code.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_get_session_refreshes_expired_join_code() -> None:
+    """Host state refreshes an expired stored join code for an existing session."""
+    plugin = _create_plugin()
+    session = _session()
+    session.join_code = "OLDJOIN"
+    session.join_url = "http://music-assistant.local/?join=OLDJOIN#/blind-test/join/session"
+    plugin._sessions["session"] = session
+    mass = cast("MagicMock", plugin.mass)
+    mass.webserver.auth.get_join_code_expiry = AsyncMock(return_value=None)
+    mass.webserver.auth.generate_join_code = AsyncMock(
+        return_value=("NEWJOIN", utc() + timedelta(hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS))
+    )
+
+    state = await plugin.get_session("session")
+
+    assert state["join_code"] == "NEWJOIN"
+    assert state["join_url"] == (
+        "http://music-assistant.local/?join=NEWJOIN#/blind-test/join/session"
+    )
+    assert session.join_code == "NEWJOIN"
+    assert session.join_url == "http://music-assistant.local/?join=NEWJOIN#/blind-test/join/session"
+    mass.webserver.auth.get_join_code_expiry.assert_awaited_once_with(
+        "OLDJOIN",
+        mass.webserver.auth.get_user_by_username.return_value,
+    )
+    mass.webserver.auth.generate_join_code.assert_awaited_once_with(
+        user=mass.webserver.auth.get_user_by_username.return_value,
+        expires_in_hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS,
+        max_uses=0,
+        device_name="Blind Test Guest",
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_session_keeps_active_session_join_code() -> None:
+    """Host state keeps the stored join code while that exact code is active."""
+    plugin = _create_plugin()
+    session = _session()
+    session.join_code = "OLDJOIN"
+    session.join_url = "http://music-assistant.local/?join=OLDJOIN#/blind-test/join/session"
+    plugin._sessions["session"] = session
+    mass = cast("MagicMock", plugin.mass)
+    expires_at = utc() + timedelta(hours=BLIND_TEST_JOIN_CODE_EXPIRY_HOURS)
+    mass.webserver.auth.get_join_code_expiry = AsyncMock(return_value=expires_at)
+
+    state = await plugin.get_session("session")
+    state_again = await plugin.get_session("session")
+
+    assert state["join_code"] == "OLDJOIN"
+    assert state["join_url"] == (
+        "http://music-assistant.local/?join=OLDJOIN#/blind-test/join/session"
+    )
+    assert state_again["join_code"] == "OLDJOIN"
+    mass.webserver.auth.get_join_code_expiry.assert_awaited_once_with(
+        "OLDJOIN",
+        mass.webserver.auth.get_user_by_username.return_value,
+    )
+    mass.webserver.auth.generate_join_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_create_session_trims_optional_name() -> None:
     """Session names are trimmed and may be omitted."""
     plugin = _create_plugin()
@@ -410,9 +522,9 @@ async def test_get_join_url_returns_remote_guest_link() -> None:
 
     assert (
         url
-        == "https://app.music-assistant.io/?remote_id=REMOTE123&join=BTJOIN#/blind-test/join/session"
+        == "https://app.music-assistant.io/?remote_id=REMOTE123&join=join#/blind-test/join/session"
     )
-    assert session.join_code == "BTJOIN"
+    assert session.join_code == "join"
     assert session.join_url == url
 
 
@@ -1087,7 +1199,28 @@ async def test_start_session_requires_registered_phone_for_phone_only_session() 
     with pytest.raises(InvalidDataError, match="No playback targets are available"):
         await plugin.start_session(state["session_id"], _round_payload())
 
+    session = plugin._sessions[state["session_id"]]
+    assert session.phase == BlindTestPhase.LOBBY
+    assert session.current_round_index is None
+    assert session.rounds == []
     mass.player_queues.play_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_session_does_not_expose_round_when_playback_fails() -> None:
+    """A failed playback start should not leave players on a silent question."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    mass = cast("MagicMock", plugin.mass)
+    mass.player_queues.play_media.side_effect = RuntimeError("speaker offline")
+
+    with pytest.raises(InvalidDataError, match="No playback targets are available"):
+        await plugin.start_session("session", _round_payload())
+
+    session = plugin._sessions["session"]
+    assert session.phase == BlindTestPhase.LOBBY
+    assert session.current_round_index is None
+    assert session.rounds == []
 
 
 @pytest.mark.asyncio
@@ -1278,6 +1411,11 @@ async def test_start_session_raises_clean_error_when_phone_target_disappears() -
 
     with pytest.raises(InvalidDataError, match="No playback targets are available"):
         await plugin.start_session(state["session_id"], _round_payload())
+
+    session = plugin._sessions[state["session_id"]]
+    assert session.phase == BlindTestPhase.LOBBY
+    assert session.current_round_index is None
+    assert session.rounds == []
 
 
 @pytest.mark.asyncio
@@ -1771,6 +1909,27 @@ async def test_next_round_stops_previous_playback_before_starting_new_track() ->
         ("play", "queue_1", "library://track/2"),
         ("play", "blind_test_session_alice", "library://track/2"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_next_round_does_not_expose_round_when_playback_fails() -> None:
+    """A failed next-round playback start should keep the previous reveal state."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    mass = cast("MagicMock", plugin.mass)
+    await plugin.start_session("session", _round_payload(1))
+    await plugin.reveal("session")
+    mass.player_queues.play_media.reset_mock()
+    mass.player_queues.play_media.side_effect = RuntimeError("speaker offline")
+
+    with pytest.raises(InvalidDataError, match="No playback targets are available"):
+        await plugin.next_round("session", _round_payload(2))
+
+    session = plugin._sessions["session"]
+    assert session.phase == BlindTestPhase.REVEAL
+    assert session.current_round_index == 0
+    assert len(session.rounds) == 1
+    assert session.rounds[0].track_uri == "library://track/1"
 
 
 @pytest.mark.asyncio

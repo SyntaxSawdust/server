@@ -1,5 +1,6 @@
 """Tests for the Sendspin WebSocket proxy handler."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -123,3 +124,42 @@ class TestSendspinProxyRetry:
         assert mock_ws_connect.call_count == 1
         mock_ws_response.close.assert_called_once_with(code=1011, message=b"Internal server error")
         assert result is mock_ws_response
+
+
+class TestSendspinProxyMessages:
+    """Tests for bidirectional proxy task handling."""
+
+    async def test_expected_disconnect_is_consumed(
+        self, handler: SendspinProxyHandler
+    ) -> None:
+        """Verify normal client disconnects do not leak as unretrieved task exceptions."""
+
+        async def raise_disconnect(*_: object) -> None:
+            raise ConnectionError("Connection lost")
+
+        async def wait_forever(*_: object) -> None:
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(handler, "_forward_internal_to_client", new=raise_disconnect),
+            patch.object(handler, "_forward_client_to_internal", new=wait_forever),
+        ):
+            await handler._proxy_messages(MagicMock(), MagicMock())
+
+    async def test_unexpected_forwarding_error_is_raised(
+        self, handler: SendspinProxyHandler
+    ) -> None:
+        """Verify unexpected proxy task errors are still surfaced."""
+
+        async def raise_unexpected(*_: object) -> None:
+            raise RuntimeError("boom")
+
+        async def wait_forever(*_: object) -> None:
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(handler, "_forward_internal_to_client", new=raise_unexpected),
+            patch.object(handler, "_forward_client_to_internal", new=wait_forever),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            await handler._proxy_messages(MagicMock(), MagicMock())
