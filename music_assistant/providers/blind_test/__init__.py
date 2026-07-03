@@ -6,12 +6,14 @@ Provides the backend game engine for multiplayer blind test sessions.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import secrets
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from music_assistant_models.auth import User, UserRole
 from music_assistant_models.enums import EventType, MediaType
 from music_assistant_models.errors import InvalidDataError
 from music_assistant_models.media_items import Playlist, Track
@@ -55,6 +57,8 @@ if TYPE_CHECKING:
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 EVENT_SESSION_REMOVED = "blind_test_session_removed"
+BLIND_TEST_GUEST_USER = "blind_test_guest"
+BLIND_TEST_GUEST_DISPLAY_NAME = "Blind Test Guest"
 
 
 async def setup(
@@ -92,6 +96,7 @@ class BlindTestPlugin(PluginProvider):
         """Initialize the Blind Test plugin."""
         super().__init__(mass, manifest, config, supported_features)
         self._sessions: dict[str, BlindTestSession] = {}
+        self._advance_locks: dict[str, asyncio.Lock] = {}
         self._lyrics_tasks: set[tuple[str, int, str]] = set()
         self._unregister_handles: list[Callable[[], None]] = []
 
@@ -130,6 +135,13 @@ class BlindTestPlugin(PluginProvider):
                 "blind_test/info",
                 self.get_session_info,
                 authenticated=False,
+            )
+        )
+        self._unregister_handles.append(
+            self.mass.register_api_command(
+                "blind_test/url",
+                self.get_join_url,
+                required_role="user",
             )
         )
         self._unregister_handles.append(
@@ -203,6 +215,60 @@ class BlindTestPlugin(PluginProvider):
             )
         )
 
+    async def _get_or_create_blind_test_guest_user(self) -> User:
+        """Get or create the restricted guest user for Blind Test joins."""
+        auth = self.mass.webserver.auth
+        user = await auth.get_user_by_username(BLIND_TEST_GUEST_USER)
+        if user:
+            return user
+
+        user = await auth.create_user(
+            username=BLIND_TEST_GUEST_USER,
+            role=UserRole.GUEST,
+            display_name=BLIND_TEST_GUEST_DISPLAY_NAME,
+        )
+        self.logger.info("Created Blind Test guest user account")
+        return user
+
+    async def _get_join_code(self) -> str:
+        """Return an active auth join code for Blind Test guests."""
+        auth = self.mass.webserver.auth
+        guest_user = await self._get_or_create_blind_test_guest_user()
+
+        existing_code = await auth.get_active_join_code(guest_user)
+        if existing_code:
+            return existing_code
+
+        code, _expires_at = await auth.generate_join_code(
+            user=guest_user,
+            expires_in_hours=8,
+            max_uses=0,
+            device_name="Blind Test Guest",
+        )
+        return code
+
+    def _build_join_url(self, session_id: str, code: str) -> str:
+        """Build a guest-authenticated URL for a Blind Test session."""
+        remote_access = self.mass.webserver.remote_access
+        if remote_access.is_enabled and remote_access.remote_id:
+            return (
+                "https://app.music-assistant.io/"
+                f"?remote_id={remote_access.remote_id}&join={code}"
+                f"#/blind-test/join/{session_id}"
+            )
+
+        base_url = self.mass.webserver.base_url
+        assert base_url  # for type-checker only
+        return f"{base_url}/?join={code}#/blind-test/join/{session_id}"
+
+    async def get_join_url(self, session_id: str) -> str:
+        """Return a guest-authenticated join URL for a Blind Test session."""
+        session = self._get_session(session_id)
+        session.join_code = await self._get_join_code()
+        session.join_url = self._build_join_url(session.session_id, session.join_code)
+        _touch_session(session)
+        return session.join_url
+
     async def create_session(
         self,
         player_id: str,
@@ -237,9 +303,12 @@ class BlindTestPlugin(PluginProvider):
             play_on_joined_players=play_on_joined_players,
         )
         _validate_config(config)
+        session_id = secrets.token_urlsafe(12)
+        join_code = await self._get_join_code()
         session = BlindTestSession(
-            session_id=secrets.token_urlsafe(12),
-            join_code=secrets.token_urlsafe(8),
+            session_id=session_id,
+            join_code=join_code,
+            join_url=self._build_join_url(session_id, join_code),
             config=config,
             sources=await self._resolve_session_sources(config.source_uris),
             created_at=time.time(),
@@ -352,7 +421,7 @@ class BlindTestPlugin(PluginProvider):
             cleaned_sendspin_player_id = _clean_sendspin_player_id(sendspin_player_id)
             if cleaned_sendspin_player_id != player.sendspin_player_id:
                 player.sendspin_player_id = cleaned_sendspin_player_id
-                await self._attach_player_to_current_playback(session, player)
+            await self._attach_player_to_current_playback(session, player)
         self._schedule_current_round_lyrics_hydration(session)
         return _player_state(session, player)
 
@@ -373,6 +442,7 @@ class BlindTestPlugin(PluginProvider):
             round_payload or await self.prepare_round(session_id),
         )
         start_round(session, blind_test_round, time.time())
+        self._schedule_current_round_lyrics_hydration(session)
         _touch_session(session)
         await self._play_round(session)
         return _host_state(session)
@@ -455,11 +525,17 @@ class BlindTestPlugin(PluginProvider):
         """
         session = self._get_session(session_id)
         player = _get_player_by_token(session, player_token)
-        mark_player_ready(session, player.player_id)
         player.last_seen = time.time()
+        if session.phase != BlindTestPhase.REVEAL:
+            _touch_session(session)
+            return _player_state(session, player)
+        mark_player_ready(session, player.player_id)
         _touch_session(session)
         if are_active_players_ready(session):
-            await self._advance_from_reveal(session)
+            advance_lock = self._advance_locks.setdefault(session.session_id, asyncio.Lock())
+            async with advance_lock:
+                if session.phase == BlindTestPhase.REVEAL and are_active_players_ready(session):
+                    await self._advance_from_reveal(session)
         self._schedule_current_round_lyrics_hydration(session)
         return _player_state(session, player)
 
@@ -501,6 +577,7 @@ class BlindTestPlugin(PluginProvider):
         session = self._get_session(session_id)
         await self._stop_playback(session)
         self._sessions.pop(session_id, None)
+        self._advance_locks.pop(session_id, None)
         self.mass.signal_event(
             EventType.UNKNOWN,
             object_id=session_id,
@@ -522,7 +599,9 @@ class BlindTestPlugin(PluginProvider):
         if round_payload is None:
             round_payload = await self.prepare_round(session.session_id)
         blind_test_round = _round_from_payload(session, round_payload)
+        await self._stop_playback(session)
         start_round(session, blind_test_round, time.time())
+        self._schedule_current_round_lyrics_hydration(session)
         _touch_session(session)
         await self._play_round(session)
 
@@ -537,6 +616,7 @@ class BlindTestPlugin(PluginProvider):
         self._unregister_handles.clear()
         self._lyrics_tasks.clear()
         self._sessions.clear()
+        self._advance_locks.clear()
         await super().unload(is_removed)
 
     def _get_session(self, session_id: str) -> BlindTestSession:
@@ -594,13 +674,16 @@ class BlindTestPlugin(PluginProvider):
             _touch_session(session)
 
     def _sync_answering_phase_and_schedule_lyrics(self, session: BlindTestSession) -> None:
-        """Sync automatic reveal state and schedule reveal-only lyrics."""
+        """Sync automatic reveal state and schedule active-round lyrics."""
         self._sync_answering_phase(session)
         self._schedule_current_round_lyrics_hydration(session)
 
     def _schedule_current_round_lyrics_hydration(self, session: BlindTestSession) -> None:
-        """Fetch current reveal lyrics in the background without blocking players."""
-        if session.phase != BlindTestPhase.REVEAL or session.current_round_index is None:
+        """Fetch current round lyrics in the background without blocking players."""
+        if (
+            session.phase not in (BlindTestPhase.ANSWERING, BlindTestPhase.REVEAL)
+            or session.current_round_index is None
+        ):
             return
         current_round = get_current_round(session)
         if current_round.lyrics_loaded:
@@ -628,13 +711,13 @@ class BlindTestPlugin(PluginProvider):
         round_index: int,
         track_uri: str,
     ) -> None:
-        """Fetch lyrics for a revealed round once."""
+        """Fetch lyrics for an active round once."""
         task_key = (session_id, round_index, track_uri)
         try:
             session = self._sessions.get(session_id)
             if (
                 session is None
-                or session.phase != BlindTestPhase.REVEAL
+                or session.phase not in (BlindTestPhase.ANSWERING, BlindTestPhase.REVEAL)
                 or session.current_round_index != round_index
             ):
                 return
@@ -658,7 +741,7 @@ class BlindTestPlugin(PluginProvider):
             session = self._sessions.get(session_id)
             if (
                 session is None
-                or session.phase != BlindTestPhase.REVEAL
+                or session.phase not in (BlindTestPhase.ANSWERING, BlindTestPhase.REVEAL)
                 or session.current_round_index != round_index
             ):
                 return
@@ -680,9 +763,14 @@ class BlindTestPlugin(PluginProvider):
         phone_player_ids: set[str] = set()
         if session.config.play_on_joined_players:
             phone_player_ids = {
-                player.sendspin_player_id
+                sendspin_player_id
                 for player in session.players.values()
-                if player.connected and player.sendspin_player_id
+                if player.connected
+                and (
+                    sendspin_player_id := self._get_available_sendspin_player_id(
+                        player.sendspin_player_id
+                    )
+                )
             }
             if session.config.play_on_player:
                 phone_player_ids.discard(session.config.player_id)
@@ -764,6 +852,18 @@ class BlindTestPlugin(PluginProvider):
             return set()
         return set(groupable_child_ids)
 
+    def _get_available_sendspin_player_id(self, sendspin_player_id: str | None) -> str | None:
+        """Return a temporary Sendspin player ID if it is registered in MA."""
+        if not sendspin_player_id or not _is_blind_test_sendspin_player_id(sendspin_player_id):
+            return None
+        if self.mass.players.get_player(sendspin_player_id) is None:
+            self.logger.debug(
+                "Skipping Blind Test phone player %s because Sendspin is not registered",
+                sendspin_player_id,
+            )
+            return None
+        return sendspin_player_id
+
     def _get_playback_target_ids(self, session: BlindTestSession) -> set[str]:
         """Return all configured and temporary playback target IDs for a session."""
         player_ids: set[str] = set()
@@ -790,10 +890,15 @@ class BlindTestPlugin(PluginProvider):
             or session.phase not in (BlindTestPhase.ANSWERING, BlindTestPhase.REVEAL)
         ):
             return
-        leader_id = self._get_current_playback_leader_id(session, player.sendspin_player_id)
-        if not leader_id or not self._can_group_players(leader_id, player.sendspin_player_id):
+        sendspin_player_id = self._get_available_sendspin_player_id(player.sendspin_player_id)
+        if not sendspin_player_id:
             return
-        await self._sync_playback_targets(leader_id, {player.sendspin_player_id})
+        leader_id = self._get_current_playback_leader_id(session, sendspin_player_id)
+        if not leader_id or not self._can_group_players(leader_id, sendspin_player_id):
+            return
+        if self._is_player_already_synced(leader_id, sendspin_player_id):
+            return
+        await self._sync_playback_targets(leader_id, {sendspin_player_id})
 
     async def _get_next_source_track(self, session: BlindTestSession) -> Track:
         """Return a random unused track from configured sources."""
@@ -822,6 +927,8 @@ class BlindTestPlugin(PluginProvider):
         """Return whether MA reports that the child can join the leader."""
         leader = self.mass.players.get_player(leader_id)
         child = self.mass.players.get_player(child_id)
+        if leader is None or child is None:
+            return False
         can_group_with = getattr(leader, "can_group_with", None)
         if can_group_with is None and (state := getattr(leader, "state", None)):
             can_group_with = getattr(state, "can_group_with", None)
@@ -829,6 +936,27 @@ class BlindTestPlugin(PluginProvider):
             return False
         child_provider_id = getattr(getattr(child, "provider", None), "instance_id", None)
         return child_id in can_group_with or child_provider_id in can_group_with
+
+    def _is_player_already_synced(self, leader_id: str, child_id: str) -> bool:
+        """Return whether MA already reports the child as synced to the leader."""
+        leader = self.mass.players.get_player(leader_id)
+        child = self.mass.players.get_player(child_id)
+        if leader is None or child is None:
+            return False
+
+        leader_state = getattr(leader, "state", None)
+        leader_group_members = getattr(leader_state, "group_members", None)
+        if leader_group_members is None:
+            leader_group_members = getattr(leader, "group_members", None)
+        if child_id in (leader_group_members or ()):
+            return True
+
+        child_state = getattr(child, "state", None)
+        synced_to = getattr(child_state, "synced_to", None) or getattr(child, "synced_to", None)
+        active_group = getattr(child_state, "active_group", None) or getattr(
+            child, "active_group", None
+        )
+        return leader_id in (synced_to, active_group)
 
     def _get_selected_playback_player_id(self, session: BlindTestSession) -> str | None:
         """Return the selected host playback player if it can be used as a stable output."""
@@ -851,13 +979,16 @@ class BlindTestPlugin(PluginProvider):
         selected_player_id = self._get_selected_playback_player_id(session)
         if selected_player_id and selected_player_id != child_player_id:
             return selected_player_id
-        phone_player_ids = sorted(
-            player.sendspin_player_id
-            for player in session.players.values()
-            if player.connected
-            and player.sendspin_player_id
-            and player.sendspin_player_id != child_player_id
-        )
+        phone_player_ids = []
+        for player in session.players.values():
+            if not player.connected:
+                continue
+            sendspin_player_id = self._get_available_sendspin_player_id(
+                player.sendspin_player_id
+            )
+            if sendspin_player_id and sendspin_player_id != child_player_id:
+                phone_player_ids.append(sendspin_player_id)
+        phone_player_ids.sort()
         return phone_player_ids[0] if phone_player_ids else None
 
 
@@ -989,9 +1120,6 @@ def _player_state(session: BlindTestSession, player: BlindTestPlayer) -> dict[st
     state["current_player_id"] = player.player_id
     if session.phase == BlindTestPhase.ANSWERING:
         for round_state in state["rounds"]:
-            round_state.pop("lyrics_loaded", None)
-            round_state.pop("lyrics", None)
-            round_state.pop("lrc_lyrics", None)
             for suggestion in round_state["suggestions"]:
                 suggestion.pop("is_correct", None)
     return state

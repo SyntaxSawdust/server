@@ -102,6 +102,7 @@ class BlindTestSession(DataClassDictMixin):
     session_id: str
     join_code: str
     config: BlindTestConfig
+    join_url: str | None = None
     phase: BlindTestPhase = BlindTestPhase.LOBBY
     created_at: float = 0
     updated_at: float = 0

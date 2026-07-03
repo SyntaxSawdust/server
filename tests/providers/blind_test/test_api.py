@@ -61,8 +61,17 @@ def _create_plugin() -> BlindTestPlugin:
     plugin.mass.music.get_item_by_uri = AsyncMock(side_effect=_get_source_item_by_uri)
     plugin.mass.metadata.get_image_url_for_item = AsyncMock(return_value=None)
     plugin.mass.metadata.get_track_lyrics = AsyncMock(return_value=(None, None))
+    plugin.mass.webserver.base_url = "http://music-assistant.local"
+    plugin.mass.webserver.remote_access = SimpleNamespace(is_enabled=False, remote_id=None)
+    plugin.mass.webserver.auth.get_user_by_username = AsyncMock(
+        return_value=SimpleNamespace(username="blind_test_guest")
+    )
+    plugin.mass.webserver.auth.create_user = AsyncMock()
+    plugin.mass.webserver.auth.get_active_join_code = AsyncMock(return_value="BTJOIN")
+    plugin.mass.webserver.auth.generate_join_code = AsyncMock(return_value=("BTJOIN", None))
     plugin.logger = MagicMock()
     plugin._sessions = {}
+    plugin._advance_locks = {}
     plugin._lyrics_tasks = set()
     plugin._unregister_handles = []
     return plugin
@@ -198,13 +207,14 @@ async def test_loaded_in_mass_registers_api_commands() -> None:
 
     await plugin.loaded_in_mass()
 
-    assert mass.register_api_command.call_count == 15
+    assert mass.register_api_command.call_count == 16
     assert [call.args[0] for call in mass.register_api_command.call_args_list] == [
         "blind_test/create",
         "blind_test/session",
         "blind_test/sessions",
         "blind_test/rename",
         "blind_test/info",
+        "blind_test/url",
         "blind_test/join",
         "blind_test/state",
         "blind_test/start",
@@ -259,6 +269,10 @@ async def test_create_session_returns_host_state() -> None:
     assert state["config"]["round_count"] == 3
     assert state["config"]["name"] == "Friday quiz"
     assert state["config"]["play_on_joined_players"] is True
+    assert state["join_code"] == "BTJOIN"
+    assert state["join_url"] == (
+        f"http://music-assistant.local/?join=BTJOIN#/blind-test/join/{state['session_id']}"
+    )
     assert state["sources"] == [
         {
             "uri": "library://track/1",
@@ -288,6 +302,25 @@ async def test_create_session_trims_optional_name() -> None:
 
     assert named["config"]["name"] == "Friday quiz"
     assert unnamed["config"]["name"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_join_url_returns_remote_guest_link() -> None:
+    """Return a remote guest auth URL for the Blind Test join screen."""
+    plugin = _create_plugin()
+    session = _session()
+    plugin._sessions["session"] = session
+    webserver = cast("Any", plugin.mass.webserver)
+    webserver.remote_access = SimpleNamespace(is_enabled=True, remote_id="REMOTE123")
+
+    url = await plugin.get_join_url("session")
+
+    assert (
+        url
+        == "https://app.music-assistant.io/?remote_id=REMOTE123&join=BTJOIN#/blind-test/join/session"
+    )
+    assert session.join_code == "BTJOIN"
+    assert session.join_url == url
 
 
 @pytest.mark.asyncio
@@ -420,6 +453,29 @@ async def test_late_joiner_is_grouped_with_current_selected_player() -> None:
 
 
 @pytest.mark.asyncio
+async def test_late_joiner_without_registered_sendspin_is_not_grouped() -> None:
+    """A late phone is not grouped until the Sendspin player is registered."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    await plugin.join_session("session", "Alice", "blind_test_session_alice")
+    await plugin.start_session("session", _round_payload())
+    mass = cast("MagicMock", plugin.mass)
+    mass.players.cmd_set_members.reset_mock()
+
+    def get_player(player_id: str) -> SimpleNamespace | None:
+        if player_id == "blind_test_session_bob":
+            return None
+        return SimpleNamespace(can_group_with=["blind_test_session_bob"])
+
+    mass.players.get_player.side_effect = get_player
+
+    result = await plugin.join_session("session", "Bob", "blind_test_session_bob")
+
+    assert result["state"]["players"][result["player_id"]]["active_from_round"] == 1
+    mass.players.cmd_set_members.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_late_reconnect_with_sendspin_id_is_grouped() -> None:
     """A late player that registers Sendspin after joining is grouped on poll."""
     plugin = _create_plugin()
@@ -453,15 +509,73 @@ async def test_repeated_state_poll_does_not_regroup_same_sendspin_id() -> None:
     await plugin.start_session("session", _round_payload())
     joined = await plugin.join_session("session", "Bob")
     mass = cast("MagicMock", plugin.mass)
-    mass.players.get_player.return_value = SimpleNamespace(
-        can_group_with=["blind_test_session_bob"]
-    )
+    grouped = False
+
+    def set_members(
+        target_player: str,  # noqa: ARG001
+        player_ids_to_add: list[str],  # noqa: ARG001
+    ) -> None:
+        nonlocal grouped
+        grouped = True
+
+    def get_player(player_id: str) -> SimpleNamespace:
+        if player_id == "queue_1":
+            group_members = ["blind_test_session_bob"] if grouped else []
+            return SimpleNamespace(
+                can_group_with=["blind_test_session_bob"],
+                state=SimpleNamespace(group_members=group_members),
+            )
+        if player_id == "blind_test_session_bob":
+            return SimpleNamespace(
+                state=SimpleNamespace(synced_to="queue_1" if grouped else None)
+            )
+        return SimpleNamespace()
+
+    mass.players.get_player.side_effect = get_player
+    mass.players.cmd_set_members.side_effect = set_members
 
     await plugin.get_player_state(
         "session",
         joined["player_token"],
         "blind_test_session_bob",
     )
+    await plugin.get_player_state(
+        "session",
+        joined["player_token"],
+        "blind_test_session_bob",
+    )
+
+    mass.players.cmd_set_members.assert_awaited_once_with(
+        target_player="queue_1",
+        player_ids_to_add=["blind_test_session_bob"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconnect_with_same_sendspin_id_regroups_when_membership_was_lost() -> None:
+    """A reconnected phone should rejoin playback even when its Sendspin ID is unchanged."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    await plugin.join_session("session", "Alice", "blind_test_session_alice")
+    await plugin.start_session("session", _round_payload())
+    joined = await plugin.join_session("session", "Bob")
+    session = plugin._sessions["session"]
+    session.players[joined["player_id"]].sendspin_player_id = "blind_test_session_bob"
+    mass = cast("MagicMock", plugin.mass)
+    mass.players.cmd_set_members.reset_mock()
+
+    def get_player(player_id: str) -> SimpleNamespace:
+        if player_id == "queue_1":
+            return SimpleNamespace(
+                can_group_with=["blind_test_session_bob"],
+                state=SimpleNamespace(group_members=[]),
+            )
+        if player_id == "blind_test_session_bob":
+            return SimpleNamespace(state=SimpleNamespace(synced_to=None, active_group=None))
+        return SimpleNamespace()
+
+    mass.players.get_player.side_effect = get_player
+
     await plugin.get_player_state(
         "session",
         joined["player_token"],
@@ -511,8 +625,8 @@ async def test_get_player_state_hides_correct_answer_while_answering() -> None:
 
 
 @pytest.mark.asyncio
-async def test_get_player_state_hides_lyrics_while_answering() -> None:
-    """Do not leak reveal lyrics during the answering phase."""
+async def test_get_player_state_includes_preloaded_lyrics_while_answering() -> None:
+    """Keep preloaded lyrics in player state so the frontend can reveal instantly."""
     plugin = _create_plugin()
     session = _session_with_round(BlindTestPhase.ANSWERING)
     session.rounds[0].lyrics = "plain lyrics"
@@ -523,9 +637,45 @@ async def test_get_player_state_hides_lyrics_while_answering() -> None:
 
     state = await plugin.get_player_state("session", joined["player_token"])
 
-    assert "lyrics" not in state["rounds"][0]
-    assert "lrc_lyrics" not in state["rounds"][0]
-    assert "lyrics_loaded" not in state["rounds"][0]
+    assert state["rounds"][0]["lyrics"] == "plain lyrics"
+    assert state["rounds"][0]["lrc_lyrics"] == "[00:01.00]synced lyrics"
+    assert state["rounds"][0]["lyrics_loaded"] is True
+
+
+@pytest.mark.asyncio
+async def test_start_session_preloads_lyrics_for_answering_state() -> None:
+    """Fetch lyrics as soon as playback starts so the client can cache them."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    mass = cast("MagicMock", plugin.mass)
+    lyrics_requested = asyncio.Event()
+    release_lyrics = asyncio.Event()
+
+    async def delayed_lyrics(_track: Track) -> tuple[str, str]:
+        lyrics_requested.set()
+        await release_lyrics.wait()
+        return ("plain lyrics", "[00:01.00]synced lyrics")
+
+    mass.metadata.get_track_lyrics = AsyncMock(side_effect=delayed_lyrics)
+
+    joined = await plugin.join_session("session", "Alice")
+    await asyncio.wait_for(plugin.start_session("session", _round_payload()), timeout=1)
+
+    await asyncio.wait_for(lyrics_requested.wait(), timeout=1)
+    release_lyrics.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    answering_state = await plugin.get_player_state("session", joined["player_token"])
+    assert answering_state["phase"] == BlindTestPhase.ANSWERING
+    assert answering_state["rounds"][0]["lyrics"] == "plain lyrics"
+    assert answering_state["rounds"][0]["lrc_lyrics"] == "[00:01.00]synced lyrics"
+    assert answering_state["rounds"][0]["lyrics_loaded"] is True
+
+    revealed_state = await plugin.answer("session", joined["player_token"], "correct")
+    assert revealed_state["rounds"][0]["lyrics"] == "plain lyrics"
+    assert revealed_state["rounds"][0]["lrc_lyrics"] == "[00:01.00]synced lyrics"
+    assert revealed_state["rounds"][0]["lyrics_loaded"] is True
+    mass.metadata.get_track_lyrics.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -654,6 +804,35 @@ async def test_start_session_plays_round_on_joined_phone_players() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_session_skips_unregistered_joined_phone_player() -> None:
+    """Joined phones are only playback targets after Sendspin registers them."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    await plugin.join_session("session", "Alice", "blind_test_session_alice")
+    mass = cast("MagicMock", plugin.mass)
+
+    def get_player(player_id: str) -> SimpleNamespace | None:
+        if player_id == "blind_test_session_alice":
+            return None
+        return SimpleNamespace()
+
+    mass.players.get_player.side_effect = get_player
+
+    state = await plugin.start_session("session", _round_payload())
+
+    assert state["phase"] == BlindTestPhase.ANSWERING
+    mass.players.cmd_set_members.assert_not_awaited()
+    mass.player_queues.play_media.assert_awaited_once_with(
+        queue_id="queue_1",
+        media="library://track/1",
+    )
+    cast("MagicMock", plugin.logger.debug).assert_any_call(
+        "Skipping Blind Test phone player %s because Sendspin is not registered",
+        "blind_test_session_alice",
+    )
+
+
+@pytest.mark.asyncio
 async def test_start_session_can_play_only_on_joined_phone_players() -> None:
     """Host can create a phone-only session without queueing to the selected player."""
     plugin = _create_plugin()
@@ -672,6 +851,26 @@ async def test_start_session_can_play_only_on_joined_phone_players() -> None:
         queue_id="blind_test_session_alice",
         media="library://track/1",
     )
+
+
+@pytest.mark.asyncio
+async def test_start_session_requires_registered_phone_for_phone_only_session() -> None:
+    """Phone-only sessions fail cleanly until at least one Sendspin player exists."""
+    plugin = _create_plugin()
+    state = await plugin.create_session(
+        player_id="",
+        source_uris=["library://track/1"],
+        play_on_player=False,
+        play_on_joined_players=True,
+    )
+    await plugin.join_session(state["session_id"], "Alice", "blind_test_session_alice")
+    mass = cast("MagicMock", plugin.mass)
+    mass.players.get_player.return_value = None
+
+    with pytest.raises(InvalidDataError, match="No playback targets are available"):
+        await plugin.start_session(state["session_id"], _round_payload())
+
+    mass.player_queues.play_media.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1008,6 +1207,56 @@ async def test_ready_advances_when_all_active_players_are_ready() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ready_after_round_already_advanced_returns_current_state() -> None:
+    """A stale ready click should refresh state instead of raising an error."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    plugin.prepare_round = AsyncMock(return_value=_round_payload(2))  # type: ignore[method-assign]
+    alice = await plugin.join_session("session", "Alice")
+    bob = await plugin.join_session("session", "Bob")
+    await plugin.start_session("session", _round_payload())
+    await plugin.answer("session", alice["player_token"], "correct")
+    await plugin.reveal("session")
+    await plugin.ready("session", alice["player_token"])
+    await plugin.ready("session", bob["player_token"])
+
+    state = await plugin.ready("session", alice["player_token"])
+
+    assert state["phase"] == BlindTestPhase.ANSWERING
+    assert state["current_round_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ready_requests_only_advance_once() -> None:
+    """Concurrent duplicate ready calls should not start multiple rounds."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+
+    async def delayed_prepare_round(_session_id: str) -> dict[str, object]:
+        await asyncio.sleep(0)
+        return _round_payload(2)
+
+    prepare_round = AsyncMock(side_effect=delayed_prepare_round)
+    plugin.prepare_round = prepare_round  # type: ignore[method-assign]
+    alice = await plugin.join_session("session", "Alice")
+    bob = await plugin.join_session("session", "Bob")
+    await plugin.start_session("session", _round_payload())
+    await plugin.answer("session", alice["player_token"], "correct")
+    await plugin.reveal("session")
+    await plugin.ready("session", alice["player_token"])
+
+    first_state, second_state = await asyncio.gather(
+        plugin.ready("session", bob["player_token"]),
+        plugin.ready("session", bob["player_token"]),
+    )
+
+    assert first_state["phase"] == BlindTestPhase.ANSWERING
+    assert second_state["phase"] == BlindTestPhase.ANSWERING
+    assert prepare_round.await_count == 1
+    assert len(plugin._sessions["session"].rounds) == 2
+
+
+@pytest.mark.asyncio
 async def test_ready_finishes_when_last_round_is_ready() -> None:
     """The last ready player finishes the game after the final round."""
     plugin = _create_plugin()
@@ -1025,6 +1274,39 @@ async def test_ready_finishes_when_last_round_is_ready() -> None:
     assert [call.args[0] for call in mass.player_queues.stop.await_args_list] == [
         "blind_test_session_alice",
         "queue_1",
+        "blind_test_session_alice",
+        "queue_1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_next_round_stops_previous_playback_before_starting_new_track() -> None:
+    """Advancing clears old phone buffers before queueing the next round."""
+    plugin = _create_plugin()
+    plugin._sessions["session"] = _session()
+    events: list[tuple[str, str, str | None]] = []
+
+    async def stop_player(player_id: str) -> None:
+        events.append(("stop", player_id, None))
+
+    async def play_media(queue_id: str, media: str) -> None:
+        events.append(("play", queue_id, media))
+
+    mass = cast("MagicMock", plugin.mass)
+    mass.player_queues.stop = AsyncMock(side_effect=stop_player)
+    mass.player_queues.play_media = AsyncMock(side_effect=play_media)
+    joined = await plugin.join_session("session", "Alice", "blind_test_session_alice")
+    await plugin.start_session("session", _round_payload(1))
+    await plugin.answer("session", joined["player_token"], "correct")
+
+    events.clear()
+    await plugin.next_round("session", _round_payload(2))
+
+    assert events == [
+        ("stop", "blind_test_session_alice", None),
+        ("stop", "queue_1", None),
+        ("play", "queue_1", "library://track/2"),
+        ("play", "blind_test_session_alice", "library://track/2"),
     ]
 
 
@@ -1046,6 +1328,8 @@ async def test_next_round_advances_then_finishes() -> None:
     assert finished["phase"] == BlindTestPhase.FINISHED
     mass = cast("MagicMock", plugin.mass)
     assert [call.args[0] for call in mass.player_queues.stop.await_args_list] == [
+        "blind_test_session_alice",
+        "queue_1",
         "blind_test_session_alice",
         "queue_1",
     ]
