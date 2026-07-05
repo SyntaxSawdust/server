@@ -717,12 +717,9 @@ async def migrate_database(  # noqa: PLR0915
         # (populated in stages 4 + 6).
         for column_sql in (
             f"ALTER TABLE {DB_TABLE_ARTISTS} ADD COLUMN [period] TEXT",
-            f"ALTER TABLE {DB_TABLE_TRACKS} ADD COLUMN [is_classical] "
-            f"INTEGER NOT NULL DEFAULT 0",
-            f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [is_classical] "
-            f"INTEGER NOT NULL DEFAULT 0",
-            f"ALTER TABLE {DB_TABLE_ARTISTS} ADD COLUMN [is_classical] "
-            f"INTEGER NOT NULL DEFAULT 0",
+            f"ALTER TABLE {DB_TABLE_TRACKS} ADD COLUMN [is_classical] INTEGER NOT NULL DEFAULT 0",
+            f"ALTER TABLE {DB_TABLE_ALBUMS} ADD COLUMN [is_classical] INTEGER NOT NULL DEFAULT 0",
+            f"ALTER TABLE {DB_TABLE_ARTISTS} ADD COLUMN [is_classical] INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 await database.execute(column_sql)
