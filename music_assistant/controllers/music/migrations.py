@@ -705,6 +705,48 @@ async def migrate_database(  # noqa: PLR0915
         except Exception as err:
             logger.warning("Could not seed default podcast/audiobook genres: %s", err)
 
+    if prev_version <= 46:
+        # databases originally created before schema version 23 still carry the legacy
+        # table-level UNIQUE(item_id, provider, media_type) constraint on the playlog
+        # table: SQLite can not drop a table constraint in place, so the migration that
+        # introduced the userid column could only replace the separate index. That
+        # leftover 3-column constraint conflicts with the current per-user uniqueness
+        # (item_id, provider, media_type, userid) and makes the playlog upserts fail
+        # with "UNIQUE constraint failed: playlog.item_id, playlog.provider,
+        # playlog.media_type" as soon as the same item is logged for another user.
+        # Detect the leftover constraint and rebuild the table without it.
+        has_legacy_constraint = False
+        for index in await database.get_rows_from_query(
+            f"SELECT name FROM pragma_index_list('{DB_TABLE_PLAYLOG}') WHERE [unique] = 1"
+        ):
+            index_columns = [
+                index_column["name"]
+                for index_column in await database.get_rows_from_query(
+                    f"SELECT name FROM pragma_index_info('{index['name']}')"
+                )
+            ]
+            if index_columns == ["item_id", "provider", "media_type"]:
+                has_legacy_constraint = True
+                break
+        if has_legacy_constraint:
+            await database.execute(f"DROP TABLE IF EXISTS {DB_TABLE_PLAYLOG}_old")
+            await database.execute(f"DROP INDEX IF EXISTS {DB_TABLE_PLAYLOG}_unique_idx")
+            await database.execute(
+                f"ALTER TABLE {DB_TABLE_PLAYLOG} RENAME TO {DB_TABLE_PLAYLOG}_old"
+            )
+            await create_tables()
+            # copy over the existing entries; rows that predate the userid column
+            # (userid NULL) can not be attributed to a user and are dropped
+            await database.execute(
+                f"INSERT OR REPLACE INTO {DB_TABLE_PLAYLOG} "
+                "(item_id, provider, media_type, name, image, timestamp, fully_played, "
+                "seconds_played, userid, queue_id, user_initiated, playback_speed) "
+                "SELECT item_id, provider, media_type, name, image, timestamp, fully_played, "
+                "seconds_played, userid, queue_id, user_initiated, playback_speed "
+                f"FROM {DB_TABLE_PLAYLOG}_old WHERE userid IS NOT NULL"
+            )
+            await database.execute(f"DROP TABLE {DB_TABLE_PLAYLOG}_old")
+
     # save changes
     await database.commit()
 
