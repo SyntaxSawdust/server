@@ -22,6 +22,10 @@ class CoreController:
 
     domain: str  # used as identifier (=name of the module)
     manifest: ProviderManifest  # some info for the UI only
+    # config: the controller's active configuration, assigned at startup/reload and kept
+    # up to date by the config controller, so internal code can read config values
+    # (including entry defaults) without rebuilding the config entries
+    config: CoreConfig
 
     def __init__(self, mass: MusicAssistant) -> None:
         """Initialize core controller."""
@@ -39,6 +43,11 @@ class CoreController:
             builtin=True,
             allow_disable=False,
         )
+
+    @property
+    def translation_owner(self) -> str:
+        """Return the "core.<domain>" namespace this module's translation strings resolve under."""
+        return f"core.{self.domain}"
 
     async def get_config_entries(
         self,
@@ -64,6 +73,7 @@ class CoreController:
             config = await self.mass.config.get_core_config(self.domain)
         log_level = str(config.get_value(CONF_LOG_LEVEL))
         self._set_logger(log_level)
+        self.config = config
         await self.setup(config)
         await self.post_setup()
 

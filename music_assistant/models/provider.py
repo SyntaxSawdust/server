@@ -127,6 +127,12 @@ class Provider:
 
     @property
     @final
+    def translation_owner(self) -> str:
+        """Return the "provider.<domain>" namespace this provider's translation strings resolve under."""
+        return f"provider.{self.domain}"
+
+    @property
+    @final
     def name(self) -> str:
         """Return (custom) friendly name for this provider instance."""
         if self.config.name:
@@ -172,13 +178,11 @@ class Provider:
             "type": self.type.value,
             "domain": self.domain,
             "name": self.name,
-            "default_name": self.default_name,
-            "instance_name_postfix": self.instance_name_postfix,
             "instance_id": self.instance_id,
-            "lookup_key": self.instance_id,  # include for backwards compatibility
             "supported_features": [x.value for x in self.supported_features],
             "available": self.available,
             "is_streaming_provider": getattr(self, "is_streaming_provider", None),
+            "lookup_key": self.instance_id,  # include for backwards compatibility
         }
 
     def supports_feature(self, feature: ProviderFeature) -> bool:
@@ -194,9 +198,8 @@ class Provider:
 
     def _update_config_value(self, key: str, value: Any, encrypted: bool = False) -> None:
         """Update a config value."""
+        # the config controller also updates the cached copy within this provider instance
         self.mass.config.set_raw_provider_config_value(self.instance_id, key, value, encrypted)
-        # also update the cached copy within the provider instance
-        self.config.values[key].value = value
 
     def _set_log_level_from_config(self, config: ProviderConfig) -> None:
         """Set log level from config."""
