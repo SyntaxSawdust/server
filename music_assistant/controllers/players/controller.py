@@ -61,7 +61,6 @@ from music_assistant.constants import (
     ATTR_ACTIVE_SOURCE,
     ATTR_ANNOUNCEMENT_IN_PROGRESS,
     ATTR_AVAILABLE,
-    ATTR_ELAPSED_TIME,
     ATTR_ENABLED,
     ATTR_FAKE_MUTE,
     ATTR_FAKE_POWER,
@@ -72,6 +71,7 @@ from music_assistant.constants import (
     ATTR_MUTE_CONTROL,
     ATTR_MUTE_LOCK,
     ATTR_POWER_CONTROL,
+    ATTR_POWERED,
     ATTR_PREVIOUS_VOLUME,
     ATTR_SUPPORTED_FEATURES,
     ATTR_VOLUME_CONTROL,
@@ -131,6 +131,15 @@ if TYPE_CHECKING:
     from music_assistant import MusicAssistant
 
 CACHE_CATEGORY_PLAYER_POWER = 1
+
+# state keys that carry the current_media playback-position anchor; these only
+# change on discrete position events (play/pause/seek/track change/buffer correction)
+POSITION_ANCHOR_KEYS = frozenset(
+    {
+        "current_media.elapsed_time",
+        "current_media.elapsed_time_last_updated",
+    }
+)
 
 # Sentinel used to detect omitted optional arguments where ``None`` is a valid value.
 _SENTINEL: Any = object()
@@ -263,6 +272,9 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         for handle in self._pending_protocol_evaluations.values():
             handle.cancel()
         self._pending_protocol_evaluations.clear()
+        for player in self._players.values():
+            if player.sleep_timer_expires_at is not None:
+                self.mass.cancel_timer(self._sleep_timer_task_id(player.player_id))
 
     async def on_provider_loaded(self, provider: PlayerProvider) -> None:
         """Handle logic when a provider is loaded."""
@@ -485,6 +497,55 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         if control := self._controls.get(control_id):
             return control
         return None
+
+    @api_command("players/sleep_timer/get")
+    def get_sleep_timer(self, player_id: str) -> float | None:
+        """
+        Return the active sleep timer expiry timestamp for the player.
+
+        :param player_id: Player ID to check.
+        """
+        player = self._get_player_with_redirect(player_id)
+        return player.sleep_timer_expires_at
+
+    @api_command("players/sleep_timer/set")
+    def set_sleep_timer(self, player_id: str, seconds: int) -> float:
+        """
+        Set a sleep timer for the player.
+
+        :param player_id: Player ID to set the timer for.
+        :param seconds: Delay in seconds before playback is stopped.
+        """
+        if seconds <= 0:
+            msg = "Sleep timer duration must be greater than zero seconds"
+            raise InvalidDataError(msg)
+        player = self._get_player_with_redirect(player_id)
+        try:
+            # guard against absurd durations that overflow the float timestamp math
+            expires_at = time.time() + seconds
+        except OverflowError:
+            msg = "Sleep timer duration is too large to schedule"
+            raise InvalidDataError(msg) from None
+        player.set_sleep_timer_expires_at(expires_at)
+        player.update_state()
+        self._signal_sleep_timer_updated(player, expires_at)
+        self.mass.call_later(
+            seconds,
+            self._handle_sleep_timer_expired,
+            player.player_id,
+            task_id=self._sleep_timer_task_id(player.player_id),
+        )
+        return expires_at
+
+    @api_command("players/sleep_timer/clear")
+    def clear_sleep_timer(self, player_id: str) -> None:
+        """
+        Clear the active sleep timer for the player.
+
+        :param player_id: Player ID to clear the timer for.
+        """
+        player = self._get_player_with_redirect(player_id)
+        self._clear_sleep_timer(player)
 
     # Player commands
 
@@ -1308,10 +1369,10 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
 
         if player.state.group_members:
             # player is a sync leader (a non-group player with synced followers).
-            # Ungroup all followers from it.
-            await self.cmd_set_members(
-                player.player_id, player_ids_to_remove=player.state.group_members
-            )
+            # Remove only the leader itself: _handle_set_members will either transfer
+            # leadership to a remaining member (keeping playback alive) or, when no
+            # members remain / nothing is playing, dissolve the group and stop.
+            await self.cmd_set_members(player.player_id, player_ids_to_remove=[player.player_id])
             return
         # unjoin from any dynamic sync groups if we're currently in one (edge case)
         # this is in particular used for the Home Assistant integration which does
@@ -1540,6 +1601,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             player.set_config(player_config)
             # update state again now that config is loaded
             player.update_state(signal_event=False)
+            self._save_underlying_player_id(player)
             # call hook after the player is registered and config is set
             await player.on_config_updated()
 
@@ -1575,6 +1637,9 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         if player.player_id in self._players:
             self._players[player.player_id] = player
             player.update_state()
+            # the derived-transport edge may have been set/revoked after the
+            # initial registration (e.g. via a bridge claim)
+            self._save_underlying_player_id(player)
             # Also schedule update when replacing existing player
             self._schedule_update_all_players()
             return
@@ -1589,6 +1654,10 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             return
         if not (player := self.get_player(player_id)):
             return
+        # mark dirty right away (not at execution): a trigger means state the player
+        # derives from changed, and a direct update_state call may come in before
+        # the debounced one runs
+        player.mark_state_dirty()
         task_id = f"player_update_state_{player_id}"
         self.mass.call_later(
             debounce_delay,
@@ -1619,6 +1688,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             self._player_command_locks.pop(f"{prefix}_{player_id}", None)
         if handle := self._pending_protocol_evaluations.pop(player_id, None):
             handle.cancel()
+        self._clear_sleep_timer(player)
         self.mass.player_queues.on_player_remove(player_id, permanent=permanent)
         await player.on_unload()
         if permanent:
@@ -1706,12 +1776,30 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         # volume limit enforcement
         return ((device_volume - min_volume) * 100) // volume_range
 
+    def on_player_position_jumped(self, player: Player) -> None:
+        """
+        Handle a discrete jump of a player's corrected playback position.
+
+        Called by a Player when its corrected position moved significantly
+        outside regular playback progression (seek or buffer correction). This
+        is not an event by itself: it re-bases the active queue's timing on the
+        fresh position and nudges related players so derived positions stay in
+        sync; current_media then re-anchors from the corrected queue time on
+        the follow-up update, which emits the actual update event.
+        """
+        if self.mass.closing:
+            return
+        self.mass.player_queues.on_player_elapsed_time_corrected(player)
+        self.trigger_player_update(player.player_id)
+        self._forward_state_update(player, {})
+
     def signal_player_state_update(
         self,
         player: Player,
         changed_values: dict[str, tuple[Any, Any]],
         force_update: bool = False,
         skip_forward: bool = False,
+        media_position_jumped: bool = False,
     ) -> None:
         """
         Signal a player state update.
@@ -1727,32 +1815,18 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         if not player.state.enabled and ATTR_ENABLED not in changed_values:
             return
 
-        # to prevent spamming the eventbus on small changes (e.g. elapsed time),
-        # we check if there are only changes in the elapsed time and send
-        # a lightweight event.
-        clean_changed_keys = set(changed_values.keys()) - {
-            "current_media.elapsed_time",
-            "elapsed_time_last_updated",
-        }
-        if len(clean_changed_keys) == 0 and not force_update:
-            # nothing changed
-            return
-
-        if clean_changed_keys == {ATTR_ELAPSED_TIME} and not force_update:
-            now = time.time()
-            prev_elapsed, new_elapsed = changed_values[ATTR_ELAPSED_TIME]
-            prev_updated, new_updated = changed_values.get("elapsed_time_last_updated", (now, now))
-            prev_corrected = (prev_elapsed or 0) + (now - (prev_updated or now))
-            new_corrected = (new_elapsed or 0) + (now - (new_updated or now))
-            if abs(prev_corrected - new_corrected) > 1.0:
-                # Significant elapsed_time drift / seek / jump - notify the queue and
-                # fan out to related players so derived elapsed_time on parents/groups
-                # stays in sync. Skipping the forward on small ticks avoids a per-second
-                # cascade through group → children → group.
-                self.mass.player_queues.on_player_elapsed_time_corrected(player)
-                if not skip_forward or force_update:
-                    self._forward_state_update(player, changed_values)
-            return
+        # The current_media position anchor only changes on discrete events
+        # (play/pause/seek/track change/buffer correction), so a change set holding
+        # only anchor keys represents a position correction rather than a regular
+        # state change.
+        non_anchor_keys = changed_values.keys() - POSITION_ANCHOR_KEYS
+        if len(non_anchor_keys) == 0 and not force_update:
+            if not media_position_jumped:
+                # anchor adoption without a significant corrected-position change
+                return
+            # current_media's corrected position jumped (seek or buffer correction
+            # reached the current media): emit the full player update below so
+            # consumers see the fresh position
 
         if self.logger.isEnabledFor(VERBOSE_LOG_LEVEL):
             self.logger.log(
@@ -1773,8 +1847,15 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             )
 
         # Kick async palette extraction on cold cache. On transition prefetch
-        # the next queue item too.
-        if (current_media := player.state.current_media) and current_media.image_url:
+        # the next queue item too. Skip players that mirror another player's media
+        # (grouped/synced members, protocol children): their current_media - palette
+        # included - is taken wholesale from the owner, so resolving it per member is
+        # wasted work that also produces duplicate state updates across the group.
+        if (
+            not self._mirrors_parent_media(player)
+            and (current_media := player.state.current_media)
+            and current_media.image_url
+        ):
             if current_media.palette is None:
                 self._schedule_palette_fetch(player_id, current_media.image_url)
             if "current_media.image_url" in changed_values or "current_media" in changed_values:
@@ -1789,7 +1870,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             removed_members = set(prev_group_members or []) - set(new_group_members or [])
             for _removed_player_id in removed_members:
                 if removed_player := self.get_player(_removed_player_id):
-                    removed_player.update_state()
+                    removed_player.refresh_state()
 
         # detect when active_source changes to
         # something external while we have a grouped protocol active
@@ -1801,11 +1882,10 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 player,
                 task_id=task_id,
             )
-        became_inactive = (
-            ATTR_AVAILABLE in changed_values and changed_values[ATTR_AVAILABLE][1] is False
-        ) or (ATTR_ENABLED in changed_values and changed_values[ATTR_ENABLED][1] is False)
-        if became_inactive and (player.state.active_group or player.state.synced_to):
-            self.mass.create_task(self._cleanup_player_memberships(player.player_id))
+        # only steer into the (relatively expensive) membership cleanup when a field
+        # that can require an unsync actually changed - this runs on every state tick
+        if changed_values.keys() & {ATTR_AVAILABLE, ATTR_ENABLED, ATTR_POWERED}:
+            self._handle_membership_cleanup_on_state_change(player, changed_values)
 
         # enforce volume limits when volume changes externally
         if "volume_level" in changed_values:
@@ -1893,7 +1973,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 player.state.volume_control,
                 player.state.mute_control,
             ):
-                self.mass.loop.call_soon(player.update_state)
+                self.mass.loop.call_soon(player.refresh_state)
 
     def remove_player_control(self, control_id: str) -> None:
         """Remove a player_control from the player manager."""
@@ -2346,6 +2426,23 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 )
                 await self._handle_cmd_stop(group.player_id)
 
+    def _mirrors_parent_media(self, player: Player) -> bool:
+        """
+        Return True if the player's current_media is taken from another player.
+
+        Grouped/synced members and protocol children mirror their parent's
+        current_media (palette included), so they must not resolve it themselves.
+
+        :param player: The player to check.
+        """
+        state = player.state
+        # a self-referential active_group/synced_to is not a real parent (mirror the
+        # != self guard in Player.__final_current_media), so it must not skip resolution
+        parent_id = state.active_group or state.synced_to
+        if parent_id and parent_id != player.player_id:
+            return True
+        return state.type == PlayerType.PROTOCOL and player.protocol_parent_id is not None
+
     def _schedule_palette_fetch(
         self, player_id: str, image_url: str | None, *, trigger_update: bool = True
     ) -> None:
@@ -2443,6 +2540,8 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         self, player: Player, changed_values: dict[str, tuple[Any, Any]]
     ) -> None:
         """Forward a player state update to related players (groups, sync parent, protocols)."""
+        # TODO: make this fan-out change-aware (skip relatives that derive nothing from
+        # the changed fields) once reverse indexes for synced_to/active_group exist.
         # Propagate group or sync-leader updates to child players.
         if player.state.group_members:
             for child_player in self.iter_group_members(player, exclude_self=True):
@@ -2517,6 +2616,30 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         elapsed = time.time() - start_timestamp
         if elapsed < minimal_time:
             await asyncio.sleep(minimal_time - elapsed)
+
+    def _handle_membership_cleanup_on_state_change(
+        self, player: Player, changed_values: dict[str, tuple[Any, Any]]
+    ) -> None:
+        """Detach a player from its (sync)groups when a state change requires it."""
+        # A player that became unavailable or disabled can no longer be commanded,
+        # so we drop it from its parent group/leader directly.
+        became_inactive = (
+            ATTR_AVAILABLE in changed_values and changed_values[ATTR_AVAILABLE][1] is False
+        ) or (ATTR_ENABLED in changed_values and changed_values[ATTR_ENABLED][1] is False)
+        if became_inactive and (player.state.active_group or player.state.synced_to):
+            self.mass.create_task(self._cleanup_player_memberships(player.player_id))
+
+        # A player whose power was turned off outside of an MA power command (e.g. its
+        # linked power control was switched off directly) must be unsynced too. We act
+        # only on an explicit on->off transition, leaving players without power control
+        # (powered == None) untouched. The player is still reachable here, so we route
+        # through cmd_ungroup which also transfers leadership when it is a sync leader.
+        if (
+            changed_values.get(ATTR_POWERED) == (True, False)
+            and player.state.type == PlayerType.PLAYER
+            and (player.state.synced_to or player.state.active_group or player.state.group_members)
+        ):
+            self.mass.create_task(self.cmd_ungroup(player.player_id))
 
     async def _cleanup_player_memberships(self, player_id: str) -> None:
         """Ensure a player is detached from any groups or syncgroups."""
@@ -3106,10 +3229,23 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
         :param player_ids_to_remove: List of player_id's to remove from the parent player.
         """
         target_player = parent_player.player_id
-        # handle dissolve sync group if the target player is currently
-        # a sync leader and is being removed from itself
+        # handle the sync leader being removed from itself: either transfer leadership
+        # to a remaining member (keeping playback alive) or dissolve the group entirely
         should_stop = False
         if player_ids_to_remove and target_player in player_ids_to_remove:
+            remaining_members = [
+                m
+                for m in parent_player.state.group_members
+                if m != target_player
+                and m not in player_ids_to_remove
+                and (member := self.get_player(m))
+                and member.state.available
+            ]
+            active_queue = self.get_active_queue(parent_player)
+            if remaining_members and active_queue and active_queue.state != PlaybackState.IDLE:
+                # transfer leadership to a remaining member instead of dissolving
+                await self._transfer_ad_hoc_leadership(parent_player, remaining_members)
+                return
             self.logger.info(
                 "Dissolving sync group of player %s as it is being removed from itself",
                 parent_player.name,
@@ -3311,6 +3447,122 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                     player_ids_to_remove=filtered_native_remove or None,
                 )
 
+    async def _transfer_ad_hoc_leadership(
+        self, leader: Player, remaining_members: list[str]
+    ) -> None:
+        """
+        Transfer leadership of an ad-hoc sync group to a remaining member.
+
+        Called when the sync leader of an ad-hoc group is unjoined while other
+        members remain and playback is active. The queue is moved to a newly
+        selected leader, the remaining members are regrouped under it and playback
+        resumes at the saved position (accepting a brief audio gap).
+
+        :param leader: The current sync leader being removed from the group.
+        :param remaining_members: Available group members (excluding the leader)
+            that should keep playing under a new leader.
+        """
+        active_queue = self.get_active_queue(leader)
+        was_playing = active_queue is not None and active_queue.state == PlaybackState.PLAYING
+        new_leader_id = self._select_ad_hoc_leader(leader, remaining_members)
+        self.logger.info(
+            "Transferring leadership of %s to %s (%s remaining member(s))",
+            leader.name,
+            new_leader_id,
+            len(remaining_members),
+        )
+        # Move the queue to the new leader. transfer_queue frees the new leader from
+        # the old leader's group and stops the old leader; the playback position
+        # survives because stop() stores it in resume_pos.
+        await self.mass.player_queues.transfer_queue(
+            leader.player_id, new_leader_id, auto_play=False
+        )
+        # regroup the other remaining members under the new leader
+        other_members = [m for m in remaining_members if m != new_leader_id]
+        if other_members:
+            await self.cmd_set_members(new_leader_id, player_ids_to_add=other_members)
+        if was_playing:
+            await self.mass.player_queues.resume(new_leader_id)
+
+    def _select_ad_hoc_leader(self, leader: Player, remaining_members: list[str]) -> str:
+        """
+        Pick the new leader for an ad-hoc sync group leadership transfer.
+
+        Prefers a remaining member that supports the protocol the group is currently
+        playing on, so the other members can be regrouped under it; falls back to the
+        first remaining member. The members' own ``can_group_with`` is unusable here
+        because it is empty while they are still synced to the old leader.
+
+        :param leader: The current sync leader being removed.
+        :param remaining_members: Candidate member player_ids, already filtered for
+            availability. Must not be empty.
+        """
+        active_domain: str | None = None
+        if leader.active_output_protocol and leader.active_output_protocol != "native":
+            if protocol_player := self.get_player(leader.active_output_protocol):
+                active_domain = protocol_player.provider.domain
+        if active_domain:
+            for member_id in remaining_members:
+                member = self.get_player(member_id)
+                if member is None:
+                    continue
+                if member.provider.domain == active_domain or any(
+                    protocol.protocol_domain == active_domain and protocol.available
+                    for protocol in member.linked_output_protocols
+                ):
+                    return member_id
+        return remaining_members[0]
+
+    def _clear_sleep_timer(self, player: Player) -> None:
+        """
+        Clear the active sleep timer for the player.
+
+        :param player: Player to clear the timer for.
+        """
+        self.mass.cancel_timer(self._sleep_timer_task_id(player.player_id))
+        if player.sleep_timer_expires_at is not None:
+            player.set_sleep_timer_expires_at(None)
+            player.update_state()
+            self._signal_sleep_timer_updated(player, None)
+
+    async def _handle_sleep_timer_expired(self, player_id: str) -> None:
+        """
+        Stop playback when a player's sleep timer expires.
+
+        :param player_id: Player ID whose sleep timer expired.
+        """
+        player = self.get_player(player_id)
+        if player is None or player.sleep_timer_expires_at is None:
+            return
+        player.set_sleep_timer_expires_at(None)
+        player.update_state()
+        self._signal_sleep_timer_updated(player, None)
+        await self.cmd_stop(player_id)
+
+    def _signal_sleep_timer_updated(self, player: Player, expires_at: float | None) -> None:
+        """
+        Signal a sleep timer change for the player on the event bus.
+
+        :param player: Player whose sleep timer changed.
+        :param expires_at: New expiry timestamp, or None when the timer was cleared.
+        """
+        if player.state.type == PlayerType.PROTOCOL:
+            return
+        self.mass.signal_event(
+            EventType.PLAYER_SLEEP_TIMER_UPDATED,
+            object_id=player.player_id,
+            data=expires_at,
+        )
+
+    @staticmethod
+    def _sleep_timer_task_id(player_id: str) -> str:
+        """
+        Return the scheduled task ID for a player's sleep timer.
+
+        :param player_id: Player ID to build the task ID for.
+        """
+        return f"player_sleep_timer_{player_id}"
+
     # Private command handlers (no permission checks)
 
     async def _handle_cmd_resume(
@@ -3453,7 +3705,7 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                 assert player_control.power_off is not None  # for type checking
                 await player_control.power_off()
         # always trigger a state update to update the UI
-        player.update_state()
+        player.refresh_state()
 
         # handle 'auto play on power on' feature
         if (
@@ -3551,15 +3803,20 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
                     f"Player control {control_name} is not available"
                 )
             assert player_control.volume_set is not None
-            await player_control.volume_set(volume_level)
+            # forward the already-scaled device volume; the external control sets the
+            # raw device volume and does not apply min/max scaling of its own
+            await player_control.volume_set(device_volume)
             return
         if protocol_player := self.get_player(player.state.volume_control):
-            # redirect to protocol player volume control
+            # redirect to protocol player volume control.
+            # forward the already-scaled device volume so the min/max limits configured
+            # on this (user-facing) player are honored; the protocol player has no
+            # limits of its own, so its scaling is an identity pass-through.
             self.logger.debug(
                 "Redirecting volume command to protocol player %s",
                 protocol_player.provider.manifest.name,
             )
-            await self._handle_cmd_volume_set(protocol_player.player_id, volume_level)
+            await self._handle_cmd_volume_set(protocol_player.player_id, device_volume)
             return
 
     async def _handle_play_media(self, player_id: str, media: PlayerMedia) -> None:
@@ -3803,6 +4060,16 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             ):
                 await target_player.play()
                 return
+            # No active protocol target: if the player natively supports pause and the active
+            # (external) source can be paused, unpause the player directly instead of
+            # restarting the source.
+            if (
+                active_source
+                and active_source.can_play_pause
+                and PlayerFeature.PAUSE in player.state.supported_features
+            ):
+                await player.play()
+                return
 
         # player is not paused: try to resume the player
         # Note: We handle resume inline here without calling _handle_cmd_resume
@@ -3853,17 +4120,24 @@ class PlayerController(ProtocolLinkingMixin, CoreController):
             )
             raise PlayerCommandFailed(msg)
         # Delegate to active protocol player if one is active
-        if not (
-            target_player := self._get_control_target(
-                player, PlayerFeature.PAUSE, require_active=True
-            )
+        if target_player := self._get_control_target(
+            player, PlayerFeature.PAUSE, require_active=True
         ):
-            # if player(protocol) does not support pause, we need to send stop
-            self.logger.debug(
-                "Player/protocol %s does not support pause, using STOP instead",
-                player.state.name,
-            )
-            await self._handle_cmd_stop(player.player_id)
+            await target_player.pause()
             return
-        # handle command on player(protocol) directly
-        await target_player.pause()
+        # No active protocol target: if the player natively supports pause and the active
+        # (external) source can be paused, forward the command to the player itself instead
+        # of stopping it (mirrors the external-source handling in cmd_seek/cmd_next_track).
+        if (
+            active_source
+            and active_source.can_play_pause
+            and PlayerFeature.PAUSE in player.state.supported_features
+        ):
+            await player.pause()
+            return
+        # player/protocol does not support pause: fall back to stop
+        self.logger.debug(
+            "Player/protocol %s does not support pause, using STOP instead",
+            player.state.name,
+        )
+        await self._handle_cmd_stop(player.player_id)

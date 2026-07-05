@@ -29,7 +29,6 @@ from music_assistant_models.media_items import (
     MediaItemMetadata,
     MediaItemType,
     ProviderMapping,
-    Track,
     UniqueList,
 )
 
@@ -69,11 +68,12 @@ JSON_KEYS = (
     "genre_aliases",
     "supported_mediatypes",
     "translation_params",
+    "audiobook_artists",
 )
 
-# When set (task-local), per-item MEDIA_ITEM_UPDATED events are suppressed.
-# Used by bulk operations such as provider cleanup, where emitting an event for every
-# touched item would flood subscribers; consumers refresh in bulk afterwards instead.
+# When set (task-local), per-item MEDIA_ITEM_ADDED/UPDATED events and the on_item_updated
+# provider write-back are suppressed, so bulk operations (provider sync, provider cleanup)
+# don't flood subscribers with one event per touched item.
 SUPPRESS_MEDIA_ITEM_UPDATES: ContextVar[bool] = ContextVar(
     "SUPPRESS_MEDIA_ITEM_UPDATES", default=False
 )
@@ -175,23 +175,26 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     ) -> ItemCls:
         """Add item to library and return the new (or updated) database item."""
         new_item = False
-        # check for existing item first
-        if library_id := await self._get_library_item_by_match(item):
-            # update existing item
-            await self._update_library_item(library_id, item, overwrite=overwrite_existing)
-        else:
-            # actually add a new item in the library db
-            self.mass.music.match_provider_instances(item)
-            async with self._db_add_lock:
-                library_id = await self._add_library_item(item)
-                new_item = True
+        # batch the many writes of an item add/update into a single commit
+        async with self.mass.music.database.deferred_commit():
+            # check for existing item first
+            if library_id := await self._get_library_item_by_match(item):
+                # update existing item
+                await self._update_library_item(library_id, item, overwrite=overwrite_existing)
+            else:
+                # actually add a new item in the library db
+                self.mass.music.match_provider_instances(item)
+                async with self._db_add_lock:
+                    library_id = await self._add_library_item(item)
+                    new_item = True
         # return final library_item
         library_item = await self.get_library_item(library_id)
-        self.mass.signal_event(
-            EventType.MEDIA_ITEM_ADDED if new_item else EventType.MEDIA_ITEM_UPDATED,
-            library_item.uri,
-            library_item,
-        )
+        if not SUPPRESS_MEDIA_ITEM_UPDATES.get():
+            self.mass.signal_event(
+                EventType.MEDIA_ITEM_ADDED if new_item else EventType.MEDIA_ITEM_UPDATED,
+                library_item.uri,
+                library_item,
+            )
         return library_item
 
     @final
@@ -200,9 +203,15 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
     ) -> ItemCls:
         """Update existing library record in the library database."""
         self.mass.music.match_provider_instances(update)
-        await self._update_library_item(item_id, update, overwrite=overwrite)
+        # batch the many writes of an item update into a single commit
+        async with self.mass.music.database.deferred_commit():
+            await self._update_library_item(item_id, update, overwrite=overwrite)
         # return the updated object
         library_item = await self.get_library_item(item_id)
+        if SUPPRESS_MEDIA_ITEM_UPDATES.get():
+            # during a sync the update originates from the provider itself,
+            # so skip both the event and the write-back to that provider
+            return library_item
         self.mass.signal_event(
             EventType.MEDIA_ITEM_UPDATED,
             library_item.uri,
@@ -286,6 +295,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         order_by: str = "sort_name",
         provider: str | list[str] | None = None,
         genre: int | list[int] | None = None,
+        played_only: bool = False,
         **kwargs: Any,
     ) -> list[ItemCls]:
         """
@@ -298,6 +308,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         :param order_by: Order by field (e.g. 'sort_name', 'timestamp_added').
         :param provider: Filter by provider instance ID (single string or list).
         :param genre: Filter by genre id(s).
+        :param played_only: Only include items that have been played (last_played > 0).
         """
         items = await self.get_library_items_by_query(
             favorite=favorite,
@@ -307,6 +318,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             order_by=order_by,
             provider_filter=self._ensure_provider_filter(provider),
             genre_ids=genre,
+            played_only=played_only,
             in_library_only=True,
         )
         if (
@@ -899,6 +911,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 DB_TABLE_PROVIDER_MAPPINGS,
                 {"media_type": self.media_type.value, "item_id": db_id},
             )
+        prov_map_objs: list[dict[str, Any]] = []
         for provider_mapping in provider_mappings:
             prov_map_obj = {
                 "media_type": self.media_type.value,
@@ -912,10 +925,11 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             for key in ("url", "details", "in_library", "is_unique"):
                 if (value := getattr(provider_mapping, key, None)) is not None:
                     prov_map_obj[key] = value
-            await self.mass.music.database.upsert(
-                DB_TABLE_PROVIDER_MAPPINGS,
-                prov_map_obj,
-            )
+            prov_map_objs.append(prov_map_obj)
+        await self.mass.music.database.upsert_many(
+            DB_TABLE_PROVIDER_MAPPINGS,
+            prov_map_objs,
+        )
 
     @abstractmethod
     async def match_providers(self, db_item: ItemCls) -> None:
@@ -923,20 +937,6 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         Try to find match on all (streaming) providers for the provided (database) item.
 
         This is used to link objects of different providers/qualities together.
-        """
-
-    @abstractmethod
-    async def radio_mode_base_tracks(
-        self,
-        item: ItemCls,
-        preferred_provider_instances: list[str] | None = None,
-    ) -> list[Track]:
-        """
-        Get the list of base tracks from the controller used to calculate the dynamic radio.
-
-        :param item: The MediaItem to get base tracks for.
-        :param preferred_provider_instances: List of preferred provider instance IDs to use.
-            When provided, these providers will be tried first before falling back to others.
         """
 
     @final
@@ -952,6 +952,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         extra_query_params: dict[str, Any] | None = None,
         extra_join_parts: list[str] | None = None,
         genre_ids: int | list[int] | None = None,
+        played_only: bool = False,
         in_library_only: bool = False,
     ) -> list[ItemCls]:
         """Fetch MediaItem records from database by building the query."""
@@ -970,6 +971,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 search=search,
                 genre_ids=genre_ids,
                 provider_filter=provider_filter,
+                played_only=played_only,
                 limit=limit,
                 in_library_only=in_library_only,
             )
@@ -983,6 +985,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 search=search,
                 genre_ids=genre_ids,
                 provider_filter=provider_filter,
+                played_only=played_only,
                 in_library_only=in_library_only,
             )
         # build and execute final query
@@ -1109,7 +1112,8 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         search: str | None,
         genre_ids: list[int] | None,
         provider_filter: list[str] | None,
-        limit: int,
+        played_only: bool = False,
+        limit: int = 500,
         in_library_only: bool = False,
     ) -> None:
         """Build a fast random subquery with all filters applied."""
@@ -1125,6 +1129,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             search=search,
             genre_ids=genre_ids,
             provider_filter=provider_filter,
+            played_only=played_only,
             in_library_only=in_library_only,
         )
 
@@ -1155,6 +1160,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         search: str | None,
         genre_ids: list[int] | None,
         provider_filter: list[str] | None,
+        played_only: bool = False,
         in_library_only: bool = False,
     ) -> None:
         """Apply search, favorite, and provider filters."""
@@ -1165,6 +1171,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         if favorite is not None:
             query_parts.append(f"{self.db_table}.favorite = :favorite")
             query_params["favorite"] = favorite
+        # handle played_only filter
+        if played_only:
+            query_parts.append(f"{self.db_table}.last_played > 0")
         # handle genre filter
         if genre_ids:
             query_params["genre_ids"] = genre_ids
@@ -1271,6 +1280,22 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                     ]
                 else:
                     db_row_dict["metadata"]["images"] = [album_thumb]
+
+        if audiobook_artists := db_row_dict.get("audiobook_artists"):
+            _narrators = []
+            _authors = []
+            for artist in audiobook_artists:
+                artist_type = artist.get("artist_type")
+                if artist_type == "author":
+                    _authors.append(artist)
+                elif artist_type == "narrator":
+                    _narrators.append(artist)
+            if _authors:
+                # prevent overwriting string values
+                db_row_dict["authors"] = _authors
+            if _narrators:
+                # prevent overwriting string values
+                db_row_dict["narrators"] = _narrators
 
         return db_row_dict
 
